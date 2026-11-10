@@ -471,7 +471,8 @@ class MMPreviewImage(io.ComfyNode):
             paths = _save_batch(images, targets, format, quality, embed_workflow,
                                 cls.hidden.prompt, cls.hidden.extra_pnginfo)
         entries = _preview_entries(images, cls)
-        has_orig = compare and sync is not None and sync.get("image") is not None and len(sync["image"])
+        # always send the original: 'compare' only switches the display, so turning it on later works without a re-run
+        has_orig = sync is not None and sync.get("image") is not None and len(sync["image"])
         # no "images" key: the core preview would draw over the comparer (rgthree uses a_/b_images only)
         ui_out = {
             "b_images": entries,
