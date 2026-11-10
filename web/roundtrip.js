@@ -417,6 +417,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
       toast("success", "Saved", j.path);
       node._rtRefreshTarget?.(); // next number is now taken
     } else toast("error", "Save failed", j.error || "unknown error");
+    return j;
   };
   const stem = sourcePath ? String(sourcePath).replace(/\\/g, "/").split("/").pop().replace(/\.[^.]+$/, "") : "image";
   const btn1 = mk("💾 save");
@@ -453,7 +454,24 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     else name = window.prompt("Save as (next to the source):", `${stem}_edit`);
     if (name != null && String(name).trim() !== "") await serverSave(String(name).trim());
   };
-  node._rtButtons = [btn1, btn2];
+  const btn3 = mk("↩ send to loader");
+  btn3.tooltip = "save as _# and load it in the Load Image MM (next run works on this creation)";
+  btn3.callback = async () => {
+    const loader = findLoader(node).node;
+    if (!loader) {
+      toast("error", "Send to loader", node._rtSrcNote || "no Load Image MM found – set source");
+      return;
+    }
+    const j = await serverSave("");
+    if (!j?.ok) return;
+    const pw = loader.widgets?.find((w) => w.name === "path");
+    if (!pw) return;
+    pw.value = j.path;
+    pw.callback?.(j.path);
+    loader.setDirtyCanvas?.(true, true);
+    toast("info", `Loader #${loader.id}`, j.path);
+  };
+  node._rtButtons = [btn1, btn2, btn3];
   node._rtRemoveButtons = () => {
     for (const b of node._rtButtons || []) node.widgets?.splice(node.widgets.indexOf(b), 1);
     node._rtButtons = null;
