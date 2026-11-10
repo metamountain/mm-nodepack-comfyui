@@ -349,10 +349,15 @@ app.registerExtension({
               .then((res) => res.json())
               .then((j) => {
                 if (!j?.ok || String(iw.value) !== name) return;   // picked again meanwhile
-                node._rtPathShown = j.path;   // the picker thumbnail is the right image
-                pw.value = j.path;
-                node.graph?.change?.();
-                node.setDirtyCanvas?.(true, true);
+                const setPath = (p) => {
+                  node._rtPathShown = p;   // the picker thumbnail is the right image
+                  pw.value = p;
+                  node.graph?.change?.();
+                  node.setDirtyCanvas?.(true, true);
+                };
+                setPath(j.path);
+                // identical copies in several folders: the browser never tells which one -> say so
+                if (j.candidates?.length > 1) toast("warn", "Same image in several folders", `${j.candidates.join(" · ")} → use 📂 open… to pick the exact file`);
               })
               .catch(() => {});
           }
@@ -361,6 +366,26 @@ app.registerExtension({
         // picker + upload stay clickable even with a path set: choosing/uploading clears the path
         // (the upload widget calls iw.callback too), so the path never has to be deleted by hand
         const sync = () => node.setDirtyCanvas?.(true, true);
+        // "open…": the OS file dialog (on the ComfyUI computer) -> the real path, no upload copy
+        const ob = node.addWidget("button", "📂 open…", null, async () => {
+          let j;
+          try {
+            j = await (await api.fetchApi("/mm-nodepack/open", { method: "POST", body: JSON.stringify({ path: pw.value || "" }) })).json();
+          } catch (e) { j = { ok: false, error: String(e) }; }
+          if (!j.ok) return toast("warn", "Open", j.error || "failed");
+          if (!j.path) return;   // cancelled
+          pw.value = j.path;
+          node._rtPathShown = "";
+          node.imgs = undefined;
+          if (j.view) {
+            const img = loadImage(j.view);
+            img.onload = () => { node._rtPathShown = j.path; node.imgs = [img]; node.imageIndex = 0; app.graph.setDirtyCanvas(true, true); };
+          }
+          node.graph?.change?.();
+          node.setDirtyCanvas?.(true, true);
+        });
+        ob.serialize = false;
+        ob.options = { ...(ob.options || {}), serialize: false };
         // the thumbnail belongs to the picker; with a path it would show the wrong image
         // (after a run the node shows the path image from the backend)
         const clearThumb = () => {

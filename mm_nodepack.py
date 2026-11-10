@@ -73,7 +73,7 @@ def _pick_free(base: str, ext: str, taken=()) -> str:
         n += 1
 
 
-_ORIGIN_CACHE = {}  # (upload path, mtime, size) -> original file in output (or None)
+_ORIGIN_CACHE = {}  # (upload path, mtime, size) -> list of identical originals in output
 
 
 def _md5(p: str) -> str:
@@ -105,27 +105,33 @@ def _files_of_size(root: str, size: int) -> list:
     return hits
 
 
-def find_origin_file(src: str, out_dir: str):
-    """An upload is a copy: find the original file in the output tree. Same name + same size
-    first (content decides between several), else any file with the same size and content
-    (uploads renamed to 'image (3).png'). Pasted bitmaps have no original -> None. Cached."""
+def find_origin_files(src: str, out_dir: str) -> list:
+    """An upload is a copy: find its original(s) in the output tree. Same name + same content
+    first, else any file with the same content (uploads renamed to 'image (3).png').
+    Several hits = identical copies in different folders (the browser never sends the real
+    location, so the caller has to ask). Pasted bitmaps have no original -> []. Cached."""
     try:
         st = os.stat(src)
     except OSError:
-        return None
+        return []
     key = (os.path.abspath(src), st.st_mtime, st.st_size)
     if key in _ORIGIN_CACHE:
         return _ORIGIN_CACHE[key]
     same = _files_of_size(out_dir, st.st_size)
     named = [p for p in same if os.path.basename(p) == os.path.basename(src)]
-    res = None
-    if len(named) == 1:
-        res = named[0]
-    elif same:
+    res = []
+    if same:
         want = _md5(src)
-        res = next((p for p in (named or same) if _md5(p) == want), None)
+        res = [p for p in named if _md5(p) == want] or [p for p in same if _md5(p) == want]
+    res.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     _ORIGIN_CACHE[key] = res
     return res
+
+
+def find_origin_file(src: str, out_dir: str):
+    """The original of an upload when it is unambiguous (exactly one copy), else None."""
+    f = find_origin_files(src, out_dir)
+    return f[0] if len(f) == 1 else None
 
 
 def find_origin(src: str, out_dir: str):
@@ -401,6 +407,60 @@ def _preview_entries(tensors, cls) -> list:
 ALIASES = ["mm", "metamountain", "mm nodepack"]
 
 
+# --- native "open file" dialog of the OS (opens on the ComfyUI computer) -------------------
+def is_local_request(remote: str) -> bool:
+    """True when the browser runs on the ComfyUI computer (else the dialog would open elsewhere)."""
+    import socket
+    if remote in ("127.0.0.1", "::1"):
+        return True
+    try:
+        return remote in {ai[4][0] for ai in socket.getaddrinfo(socket.gethostname(), None)}
+    except OSError:
+        return False
+
+
+def open_dialog(start_dir: str) -> str:
+    """OS file dialog (Windows: PowerShell, macOS: osascript, Linux: zenity/kdialog). '' = cancelled."""
+    import shutil
+    import subprocess
+    import sys
+    if os.name == "nt":
+        ps = ("Add-Type -AssemblyName System.Windows.Forms;[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+              "$f=New-Object Windows.Forms.OpenFileDialog;$f.Filter='Images|*.png;*.jpg;*.jpeg;*.webp|All|*.*';"
+              "$f.InitialDirectory=$env:MM_START;$o=New-Object Windows.Forms.Form;$o.TopMost=$true;"
+              "if($f.ShowDialog($o) -eq 'OK'){$f.FileName}")
+        cmd = ["powershell", "-NoProfile", "-STA", "-Command", ps]
+    elif sys.platform == "darwin":
+        cmd = ["osascript", "-e", 'POSIX path of (choose file of type {"public.image"} default location (POSIX file (system attribute "MM_START")))']
+    elif shutil.which("zenity"):
+        cmd = ["zenity", "--file-selection", f"--filename={start_dir}/"]
+    elif shutil.which("kdialog"):
+        cmd = ["kdialog", "--getopenfilename", start_dir]
+    else:
+        raise RuntimeError("no file dialog available (install zenity or kdialog) – use upload or the path field")
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
+                       env=dict(os.environ, MM_START=start_dir), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+    return lines[-1] if lines else ""
+
+
+def view_entry(p: str):
+    """/view entry for a file inside ComfyUI's output or input folder (for the thumbnail), else None."""
+    try:
+        import folder_paths
+    except Exception:  # noqa: BLE001
+        return None
+    for kind, base in (("output", folder_paths.get_output_directory()), ("input", folder_paths.get_input_directory())):
+        base = os.path.abspath(base)
+        try:
+            if os.path.commonpath([base, os.path.abspath(p)]) == base:
+                sub = os.path.relpath(os.path.dirname(os.path.abspath(p)), base)
+                return {"filename": os.path.basename(p), "subfolder": "" if sub == "." else sub, "type": kind}
+        except ValueError:  # other drive
+            pass
+    return None
+
+
 class MMLoadImage(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -571,6 +631,21 @@ def register_routes():
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+        @PromptServer.instance.routes.post("/mm-nodepack/open")
+        async def _open(request):
+            # real path, no upload copy: the OS file dialog on the ComfyUI computer
+            if not is_local_request(request.remote):
+                return web.json_response({"ok": False, "error": "the file dialog opens on the ComfyUI computer – use upload or the path field"}, status=403)
+            try:
+                data = await request.json()
+                import folder_paths
+                cur = _clean(str(data.get("path", "")))
+                start = os.path.dirname(cur) if cur and os.path.isfile(cur) else folder_paths.get_output_directory()
+                p = await asyncio.to_thread(open_dialog, start)
+                return web.json_response({"ok": True, "path": p, "view": view_entry(p) if p else None})
+            except Exception as e:  # noqa: BLE001
+                return web.json_response({"ok": False, "error": str(e)}, status=400)
+
         @PromptServer.instance.routes.post("/mm-nodepack/resolve")
         async def _resolve(request):
             # picker/upload name ("x.png", "sub/x.png [input]") -> absolute path for the loader's path field
@@ -583,8 +658,9 @@ def register_routes():
                 inp = os.path.abspath(folder_paths.get_input_directory())
                 if os.path.commonpath([inp, p]) == inp:
                     # an upload is only a copy: show where the original lives ("" = pasted, unknown)
-                    o = await asyncio.to_thread(find_origin_file, p, folder_paths.get_output_directory())
-                    return web.json_response({"ok": True, "path": o or "", "file": p})
+                    o = await asyncio.to_thread(find_origin_files, p, folder_paths.get_output_directory())
+                    return web.json_response({"ok": True, "path": o[0] if len(o) == 1 else "", "file": p,
+                                              "candidates": o if len(o) > 1 else []})
                 return web.json_response({"ok": True, "path": p, "file": p})
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
