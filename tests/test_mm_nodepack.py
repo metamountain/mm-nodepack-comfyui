@@ -64,7 +64,7 @@ def main():
         # format: jpg, and 'same as source' keeps .webp
         t9 = next_target(src, fmt="jpg")
         check(t9.endswith(".jpg"), f"fmt jpg -> {os.path.basename(t9)}")
-        webp = os.path.join(d, "bild.webp")
+        webp = os.path.join(d, "image.webp")
         Image.new("RGB", (4, 4)).save(webp)
         t10 = next_target(webp)
         check(t10.endswith(".webp"), f"same as source webp -> {os.path.basename(t10)}")
@@ -120,8 +120,8 @@ def main():
         Image.new("RGB", (4, 4), (9, 9, 9)).save(os.path.join(outp, "Other", "orig.png"))
         check(save_dir(os.path.join(inp, "orig.png")) == os.path.join(outp, "Moods"), "save_dir: upload -> folder of the original (content match)")
         imgs = [torch.zeros(4, 4, 3)] * 2
-        tg = _targets(imgs, None, "_#", "flux/bild", "same as source")
-        check(tg == [os.path.join(outp, "flux", "bild_1.png"), os.path.join(outp, "flux", "bild_2.png")], "no source: save_as as prefix -> output/flux/bild_1,_2")
+        tg = _targets(imgs, None, "_#", "flux/image", "same as source")
+        check(tg == [os.path.join(outp, "flux", "image_1.png"), os.path.join(outp, "flux", "image_2.png")], "no source: save_as as prefix -> output/flux/image_1,_2")
         check(_targets(imgs[:1], None, "_#", "", "png") == [os.path.join(outp, "preview_1.png")], "no source, no save_as -> output/preview_1")
         check(_targets(imgs[:1], None, "_#", "../../x", "png") == [os.path.join(outp, "preview_1.png")], "no source: no escape from output")
         del sys.modules["folder_paths"]
