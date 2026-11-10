@@ -140,10 +140,11 @@ class ComparerWidget {
       ctx.textAlign = "left";
       if (hasA) {
         ctx.fillStyle = over && leftShare > 0.5 ? LABEL_HI : LABEL;
-        ctx.fillText("◀ ORIGINAL", 8, y + 3);
-      } else if (compare && node.inputs?.find((i) => i.name === "sync")?.link == null) {
+        const sid = node._rtSrcId || node._rtSrcIdLive;
+        ctx.fillText(sid ? `◀ ORIGINAL #${sid}` : "◀ ORIGINAL", 8, y + 3);
+      } else if (compare && (node._rtNote || node._rtSrcNote)) {
         ctx.fillStyle = LABEL;
-        ctx.fillText("connect sync for compare", 8, y + 3);
+        ctx.fillText(node._rtNote || node._rtSrcNote, 8, y + 3);
       }
       ctx.textAlign = "right";
       ctx.fillStyle = !over || leftShare <= 0.5 ? LABEL_HI : LABEL;
@@ -251,21 +252,56 @@ function makeTextWidget(node, name) {
   return w;
 }
 
+// Which Load Image MM feeds this preview (same rules as find_loader in roundtrip_nodes.py):
+// sync link > source "#id" > auto (the one loader upstream of images, else the only loader).
+function findLoader(node) {
+  const g = node.graph || app.graph;
+  const linkOf = (id) => (id == null ? null : (g.links?.get?.(id) ?? g.links?.[id]));
+  const syncIn = (node.inputs || []).find((i) => i.name === "sync");
+  if (syncIn?.link != null) {
+    const n = g.getNodeById(linkOf(syncIn.link)?.origin_id);
+    return n?.comfyClass === LOADER ? { node: n, note: "" } : { node: null, note: "" };
+  }
+  const loaders = (g._nodes || []).filter((n) => n.comfyClass === LOADER && n.mode !== 2 && n.mode !== 4);
+  const sel = String(node.widgets?.find((w) => w.name === "source")?.value ?? "auto").trim().replace(/^#/, "").trim();
+  if (sel && sel.toLowerCase() !== "auto") {
+    const n = loaders.find((x) => String(x.id) === sel);
+    return n ? { node: n, note: "" } : { node: null, note: `source #${sel}: no Load Image MM` };
+  }
+  const found = new Set();
+  const seen = new Set();
+  const imgIn = (node.inputs || []).find((i) => i.name === "images");
+  const stack = imgIn?.link != null ? [imgIn.link] : [];
+  while (stack.length) {
+    const l = linkOf(stack.pop());
+    if (!l || seen.has(l.id)) continue;
+    seen.add(l.id);
+    const src = g.getNodeById(l.origin_id);
+    if (!src) continue;
+    if (src.comfyClass === LOADER) { found.add(src); continue; }
+    for (const i of src.inputs || []) if (i.link != null) stack.push(i.link);
+  }
+  if (found.size === 1) return { node: [...found][0], note: "" };
+  if (!found.size && loaders.length === 1) return { node: loaders[0], note: "" };
+  const many = found.size > 1 ? [...found] : loaders;
+  if (many.length > 1) return { node: null, note: `several loaders (${many.map((n) => "#" + n.id).join(" ")}) – set source` };
+  return { node: null, note: "" };
+}
+
 function sourceFromNode(node) {
-  // The loader connected to the `source` input (its widgets: path / image).
-  const inp = (node.inputs || []).find((i) => i.name === "sync");
-  if (inp?.link == null) return null;
-  const link = app.graph?.links?.[inp.link];
-  const srcNode = link ? app.graph?.getNodeById(link.origin_id) : null;
-  if (srcNode?.comfyClass !== LOADER) return null;
-  const w = (name) => srcNode.widgets?.find((x) => x.name === name)?.value ?? "";
-  return { path: String(w("path") || ""), image: String(w("image") || "") };
+  const { node: n, note } = findLoader(node);
+  node._rtSrcNote = note;
+  node._rtSrcIdLive = n ? String(n.id) : "";
+  if (!n) return null;
+  const w = (name) => n.widgets?.find((x) => x.name === name)?.value ?? "";
+  return { path: String(w("path") || ""), image: String(w("image") || ""), id: String(n.id) };
 }
 
 function addTargetWidget(node) {
   const setTarget = (t) => {
     node._rtTarget = t;
     if (node._rtButtons?.[0]) node._rtButtons[0].tooltip = t;
+    node.setDirtyCanvas?.(true, true);  // label line shows the live source #id / note
   };
   node._rtRefreshTarget = debounce(() => {
     const s = sourceFromNode(node);
@@ -278,7 +314,7 @@ function addTargetWidget(node) {
     };
     if (!body.path && !body.image) {
       // no source: the saver falls back to the output dir, stem "preview"
-      setTarget("output/preview_# (no sync)");
+      setTarget("output/preview_# (no Load Image MM found)");
       return;
     }
     api.fetchApi("/roundtrip/target", { method: "POST", body: JSON.stringify(body) })
@@ -441,6 +477,8 @@ app.registerExtension({
       const a = Array.isArray(message?.a_images) ? message.a_images : [];
       const b = Array.isArray(message?.b_images) ? message.b_images : (Array.isArray(message?.images) ? message.images : []);
       const source = Array.isArray(message?.source) ? message.source[0] || "" : "";
+      this._rtSrcId = Array.isArray(message?.source_id) ? message.source_id[0] || "" : "";
+      this._rtNote = Array.isArray(message?.note) ? message.note[0] || "" : "";
       const cmp = this.widgets?.find((w) => w.name === "comparer");
       if (cmp) cmp.setData(a, b);
       const saved = Array.isArray(message?.saved) ? message.saved : [];
@@ -458,7 +496,7 @@ app.registerExtension({
 
     nodeType.prototype.onConnectionsChange = function (slot, type, isConnect, linkIds) {
       origConnections?.apply(this, arguments);
-      if (this.inputs?.[slot]?.name === "sync") this._rtRefreshTarget?.();
+      this._rtRefreshTarget?.();  // sync or images link changed -> source may change
       this.setDirtyCanvas?.(true, true);
     };
   },
@@ -466,6 +504,51 @@ app.registerExtension({
     if (node.comfyClass === LOADER) {
       // size info: text line + subtle overlay bottom right on the node
       const info = makeTextWidget(node, "info");
+      // picking/uploading an image clears the path field (path would win otherwise)
+      const iw = node.widgets?.find((w) => w.name === "image");
+      const pw = node.widgets?.find((w) => w.name === "path");
+      if (iw && pw) {
+        const cb = iw.callback;
+        iw.callback = function () {
+          const r = cb?.apply(this, arguments);
+          if (pw.value) {
+            pw.value = "";
+            pw.callback?.("");
+            node.setDirtyCanvas?.(true, true);
+          }
+          return r;
+        };
+        // only the source that is used is active: path set -> image picker + upload greyed out
+        const upw = node.widgets?.find((w) => w.name === "upload" || w.type === "button");
+        const sync = () => {
+          const usePath = String(pw.value || "").trim() !== "";
+          iw.disabled = usePath;
+          if (upw) upw.disabled = usePath;
+          node.setDirtyCanvas?.(true, true);
+        };
+        // the thumbnail belongs to the picker; with a path it would show the wrong image
+        // (after a run the node shows the path image from the backend)
+        const clearThumb = () => {
+          if (String(pw.value || "").trim() === "") return;
+          node.imgs = undefined;
+          if (node.images) node.images = undefined;
+          try { app.nodeOutputs && delete app.nodeOutputs[String(node.id)]; } catch (_) { /* ignore */ }
+        };
+        const pcb = pw.callback;
+        pw.callback = function () {
+          const r = pcb?.apply(this, arguments);
+          sync();
+          clearThumb();
+          return r;
+        };
+        const origCfg = node.onConfigure;
+        node.onConfigure = function () {
+          const r = origCfg?.apply(this, arguments);
+          sync();
+          return r;
+        };
+        sync();
+      }
       const origExec = node.onExecuted;
       node.onExecuted = function (message) {
         origExec?.apply(this, arguments);
@@ -495,7 +578,7 @@ app.registerExtension({
     // target preview updates when suffix/save_as/format change
     const cw = node.widgets?.find((x) => x.name === "compare");
     if (cw) { const cb0 = cw.callback; cw.callback = (...a) => { cb0?.(...a); node.setDirtyCanvas?.(true, true); }; }
-    for (const name of ["suffix", "save_as", "format"]) {
+    for (const name of ["suffix", "save_as", "format", "source"]) {
       const w = node.widgets?.find((x) => x.name === name);
       if (!w) continue;
       const cb = w.callback;

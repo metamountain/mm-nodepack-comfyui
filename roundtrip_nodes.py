@@ -217,6 +217,52 @@ def _resolve_source_path(source) -> str:
     return _default_source()["path"]
 
 
+LOADER_ID = "RoundtripLoadImage"
+
+
+def find_loader(prompt, my_id, select="auto"):
+    """Wireless source (no sync link): -> (loader prompt id or None, note).
+    select '#668' / '668' = that Load Image MM (also inside subgraphs: '12:668');
+    'auto' = the one Load Image MM upstream of our images input, else the only one in the workflow."""
+    if not isinstance(prompt, dict):
+        return None, "no prompt"
+    loaders = [k for k, v in prompt.items() if isinstance(v, dict) and v.get("class_type") == LOADER_ID]
+    sel = str(select or "").strip().lstrip("#").strip()
+    if sel and sel.lower() != "auto":
+        hit = [k for k in loaders if str(k) == sel or str(k).endswith(":" + sel)]
+        return (hit[0], "") if len(hit) == 1 else (None, f"source #{sel}: no Load Image MM with that number")
+    found, seen = [], set()
+    me = prompt.get(str(my_id)) or {}
+    stack = [v for v in [(me.get("inputs") or {}).get("images")] if isinstance(v, list)]
+    while stack:
+        nid = str(stack.pop()[0])
+        if nid in seen:
+            continue
+        seen.add(nid)
+        node = prompt.get(nid) or {}
+        if node.get("class_type") == LOADER_ID:
+            found.append(nid)
+            continue
+        stack.extend(v for v in (node.get("inputs") or {}).values() if isinstance(v, list) and len(v) == 2)
+    if len(found) == 1:
+        return found[0], ""
+    if not found and len(loaders) == 1:
+        return loaders[0], ""
+    if len(found) > 1 or len(loaders) > 1:
+        ids = ", ".join("#" + str(k).split(":")[-1] for k in (found or loaders))
+        return None, f"several Load Image MM ({ids}) – set source to one number"
+    return None, ""
+
+
+def source_from_prompt(prompt, loader_id):
+    """ROUNDTRIP_SOURCE dict of a loader read from the prompt (its image/path widgets)."""
+    inp = (prompt.get(str(loader_id)) or {}).get("inputs") or {}
+    image, path = inp.get("image", ""), inp.get("path", "")
+    if not isinstance(image, str) or not isinstance(path, str):
+        return None  # widget driven by a link: unknown before it runs
+    return make_source(resolve_source(image, path))
+
+
 def _targets(images, source, suffix, save_as, fmt) -> list:
     """One target per image in the batch – running numbers (haus_1, haus_2, ...),
     never overwriting. Same rules as next_target, but the batch reserves its own
@@ -368,7 +414,10 @@ class RoundtripPreviewSave(io.ComfyNode):
                 io.Boolean.Input("auto_save", default=False, label_on="auto save", label_off="save per button",
                                  tooltip="on: every run saves all creations; off: preview only, save with the buttons"),
                 io.Boolean.Input("compare", default=True, label_on="compare", label_off="creation only",
-                                 tooltip="slider compare with the original (needs sync)"),
+                                 tooltip="slider compare with the original"),
+                io.String.Input("source", default="auto",
+                                tooltip="without a sync link: 'auto' = the Load Image MM upstream (or the only one); "
+                                        "with several loaders type its number, e.g. #12"),
                 io.String.Input("suffix", default="_#",
                                 tooltip="appended to the source name; '#' = next free number (name_1, name_2 …)"),
                 io.String.Input("save_as", default="",
@@ -380,14 +429,23 @@ class RoundtripPreviewSave(io.ComfyNode):
             outputs=[
                 io.String.Output("saved_paths", display_name="saved", tooltip="one path per line (auto save)"),
             ],
-            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo, io.Hidden.unique_id],
         )
 
     @classmethod
-    def execute(cls, images, sync=None, auto_save=False, compare=True, suffix="_#", save_as="",
+    def execute(cls, images, sync=None, auto_save=False, compare=True, source="auto", suffix="_#", save_as="",
                 format="same as source", quality=95, embed_workflow=True):
         if images is None or len(images) == 0:
             raise ValueError("no images to preview")
+        note, src_id = "", ""
+        if sync is None:  # wireless: find the loader in the prompt
+            lid, note = find_loader(cls.hidden.prompt, cls.hidden.unique_id, source)
+            if lid is not None:
+                try:
+                    sync = source_from_prompt(cls.hidden.prompt, lid)
+                    src_id = str(lid).split(":")[-1]
+                except ValueError as e:
+                    note = str(e)
         paths = []
         if auto_save:
             targets = _targets(images, sync, suffix, save_as, format)
@@ -401,6 +459,8 @@ class RoundtripPreviewSave(io.ComfyNode):
             "a_images": _preview_entries(sync["image"][:1], cls) if has_orig else [],
             "source": [_resolve_source_path(sync) if sync is not None else ""],
             "saved": paths,
+            "source_id": [src_id],
+            "note": [note],
         }
         return io.NodeOutput("\n".join(paths), ui=ui_out)
 
