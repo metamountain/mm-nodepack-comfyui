@@ -7,7 +7,7 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 const MODES = ["slide", "hold", "off"];
-const MODE_LABEL = { slide: "◧  slide compare", hold: "◉  hold to compare", off: "○  compare off" };
+const MODE_LABEL = { slide: "compare slide", hold: "compare hold", off: "compare off" };
 
 export function compareMode(node) {
   const m = node.properties?.mm_compare;
