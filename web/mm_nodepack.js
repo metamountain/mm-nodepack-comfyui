@@ -387,9 +387,11 @@ app.registerExtension({
           upw.label = "choose file";
           upw.callback = async function (...args) {
             let j;
+            document.body.style.cursor = "progress";   // the system dialog needs a moment to appear
             try {
               j = await (await api.fetchApi("/mm-nodepack/dialog", { method: "POST", body: JSON.stringify({ mode: "open", path: pw.value || "" }) })).json();
             } catch (e) { j = { ok: false, error: String(e) }; }
+            document.body.style.cursor = "";
             if (!j.ok) return j.local === false ? upload?.apply(this, args) : toast("error", "Choose file", j.error || "failed");
             if (!j.path) return;   // cancelled
             pw.value = j.path;
