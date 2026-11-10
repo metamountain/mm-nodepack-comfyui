@@ -379,15 +379,6 @@ def _preview_entries(tensors, cls) -> list:
 ALIASES = ["mm", "metamountain", "mm nodepack"]
 
 
-def _size_text(p: str, w: int, h: int) -> str:
-    try:
-        mb = os.path.getsize(p) / 1e6
-        size = f"{mb:.1f} MB" if mb >= 1 else f"{mb * 1000:.0f} KB"
-    except OSError:
-        size = "?"
-    return f"{w}×{h} · {os.path.splitext(p)[1].lstrip('.').lower()} · {size}"
-
-
 class MMLoadImage(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -443,7 +434,7 @@ class MMLoadImage(io.ComfyNode):
         img, mask = load_image_file(p)
         src = make_source(p)
         h, w = int(img.shape[1]), int(img.shape[2])
-        info = {"info": [_size_text(p, w, h)], "path": [p]}
+        info = {"path": [p]}   # size: the frontend prints it under the thumbnail
         if _clean(path):  # path mode: the upload widget shows nothing -> preview the file
             info["images"] = _preview_entries(img[:1], cls)
         return io.NodeOutput(src, img, mask, w, h, p, ui=info)
@@ -474,8 +465,6 @@ class MMPreviewImage(io.ComfyNode):
                              tooltip="from Load Image MM: original for the compare, target folder, name and format"),
                 io.Boolean.Input("auto_save", default=False, label_on="auto save", label_off="save per button",
                                  tooltip="on: every run saves all creations; off: preview only, save with the buttons"),
-                io.Boolean.Input("compare", default=True, label_on="compare", label_off="creation only",
-                                 tooltip="slider compare with the original"),
                 io.String.Input("source", default="auto",
                                 tooltip="without a sync link: 'auto' = the Load Image MM upstream (or the only one); "
                                         "with several loaders type its number, e.g. #12"),
@@ -494,7 +483,7 @@ class MMPreviewImage(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images, sync=None, auto_save=False, compare=True, source="auto", suffix="_#", save_as="",
+    def execute(cls, images, sync=None, auto_save=False, source="auto", suffix="_#", save_as="",
                 format="same as source", quality=95, embed_workflow=True):
         if images is None or len(images) == 0:
             raise ValueError("no images to preview")
@@ -513,7 +502,7 @@ class MMPreviewImage(io.ComfyNode):
             paths = _save_batch(images, targets, format, quality, embed_workflow,
                                 cls.hidden.prompt, cls.hidden.extra_pnginfo)
         entries = _preview_entries(images, cls)
-        # always send the original: 'compare' only switches the display, so turning it on later works without a re-run
+        # always send the original: the compare toggle under the image is display-only, so turning it on later works without a re-run
         has_orig = sync is not None and sync.get("image") is not None and len(sync["image"])
         # no "images" key: the core preview would draw over the comparer (rgthree uses a_/b_images only)
         ui_out = {
@@ -556,6 +545,19 @@ def register_routes():
                     return web.json_response({"ok": False, "error": f"file not found: {p}"}, status=404)
                 target = next_target(p, str(data.get("suffix", "_#")), str(data.get("save_as", "")), str(data.get("format", "same as source")))
                 return web.json_response({"ok": True, "target": target})
+            except Exception as e:  # noqa: BLE001
+                return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+        @PromptServer.instance.routes.post("/mm-nodepack/resolve")
+        async def _resolve(request):
+            # picker/upload name ("x.png", "sub/x.png [input]") -> absolute path for the loader's path field
+            data = await request.json()
+            try:
+                import folder_paths
+                p = os.path.abspath(folder_paths.get_annotated_filepath(str(data.get("image", ""))))
+                if not os.path.isfile(p):
+                    return web.json_response({"ok": False, "error": f"file not found: {p}"}, status=404)
+                return web.json_response({"ok": True, "path": p})
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 
