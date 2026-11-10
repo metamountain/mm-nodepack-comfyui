@@ -36,6 +36,7 @@ class ComparerWidget {
     this.name = "comparer";
     this.type = "custom";
     this.serialize = false;
+    this.options = { serialize: false };   // graphToPrompt checks options.serialize
     this.value = { a: [], b: [] }; // a = original entries, b = result entries
     this.selected = 0;             // selected result variant (index into b)
     this.imgA = null;              // HTMLImageElement
@@ -226,6 +227,7 @@ function makeTextWidget(node, name) {
     name,
     type: "custom",
     serialize: false,
+    options: { serialize: false },
     value: "",
     callback: () => {},
     computeSize: (width) => [width, 20],
@@ -261,7 +263,10 @@ function sourceFromNode(node) {
 }
 
 function addTargetWidget(node) {
-  const w = node.widgets?.find((x) => x.name === "target") || makeTextWidget(node, "target");
+  const setTarget = (t) => {
+    node._rtTarget = t;
+    if (node._rtButtons?.[0]) node._rtButtons[0].tooltip = t;
+  };
   node._rtRefreshTarget = debounce(() => {
     const s = sourceFromNode(node);
     const body = {
@@ -273,19 +278,16 @@ function addTargetWidget(node) {
     };
     if (!body.path && !body.image) {
       // no source: the saver falls back to the output dir, stem "preview"
-      node.widgets.find((x) => x.name === "target").value = "→ (no sync – output/preview_#)";
-      node.setDirtyCanvas?.(true, true);
+      setTarget("output/preview_# (no sync)");
       return;
     }
     api.fetchApi("/roundtrip/target", { method: "POST", body: JSON.stringify(body) })
       .then((r) => r.json())
       .then((j) => {
-        node.widgets.find((x) => x.name === "target").value = j.ok ? `→ ${j.target}` : `→ ${j.error || "target?"}`;
-        node.setDirtyCanvas?.(true, true);
+        setTarget(j.ok ? j.target : (j.error || "target?"));
       })
       .catch((e) => {
-        node.widgets.find((x) => x.name === "target").value = `→ ${e}`;
-        node.setDirtyCanvas?.(true, true);
+        setTarget(String(e));
       });
   }, 300);
 }
@@ -326,52 +328,94 @@ function wirePointer(node, widget) {
 // ---------------------------------------------------------------------------
 // Save buttons (Preview & Save): apply to the SELECTED variant (NACHTRAG C).
 // ---------------------------------------------------------------------------
+function toast(severity, summary, detail) {
+  const t = app.extensionManager?.toast;
+  if (t?.add) t.add({ severity, summary, detail, life: severity === "error" ? 6000 : 3000 });
+  else console[severity === "error" ? "error" : "log"](`[Image Roundtrip] ${summary}: ${detail}`);
+}
+
+const PICK_TYPES = [
+  { description: "PNG", accept: { "image/png": [".png"] } },
+  { description: "JPEG", accept: { "image/jpeg": [".jpg", ".jpeg"] } },
+  { description: "WebP", accept: { "image/webp": [".webp"] } },
+];
+
+// preview file -> blob in the format of the chosen extension (PNG keeps the embedded workflow)
+async function previewBlob(entry, name, quality) {
+  const q = new URLSearchParams({ filename: entry.filename, subfolder: entry.subfolder || "", type: entry.type || "temp" });
+  const src = await (await api.fetchApi(`/view?${q}`)).blob();
+  const ext = (name.match(/\.([^.]+)$/)?.[1] || "png").toLowerCase();
+  const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "webp" ? "image/webp" : "image/png";
+  if (mime === "image/png" && src.type === "image/png") return src;
+  const bmp = await createImageBitmap(src);
+  const c = document.createElement("canvas");
+  c.width = bmp.width;
+  c.height = bmp.height;
+  c.getContext("2d").drawImage(bmp, 0, 0);
+  return await new Promise((res) => c.toBlob(res, mime, Math.max(0.01, Math.min(1, quality / 100))));
+}
+
 function addSaveButtons(node, entry, sourcePath, variant) {
   node._rtRemoveButtons?.();
   const mk = (label) => {
     const b = node.addWidget("button", label, null, () => {});
     b.serialize = false;
+    b.options = { ...(b.options || {}), serialize: false };
     return b;
   };
-  const doSave = async (saveAs) => {
+  const wv = (name, d) => node.widgets?.find((x) => x.name === name)?.value ?? d;
+  // server side: next free name next to the source (never overwrites)
+  const serverSave = async (saveAs) => {
     const body = {
-      filename: entry.filename,
-      subfolder: entry.subfolder || "",
-      type: entry.type || "temp",
-      source: sourcePath,
-      suffix: node.widgets?.find((x) => x.name === "suffix")?.value ?? "_#",
-      save_as: saveAs,
-      format: node.widgets?.find((x) => x.name === "format")?.value ?? "same as source",
-      quality: node.widgets?.find((x) => x.name === "quality")?.value ?? 95,
+      filename: entry.filename, subfolder: entry.subfolder || "", type: entry.type || "temp",
+      source: sourcePath, suffix: wv("suffix", "_#"), save_as: saveAs,
+      format: wv("format", "same as source"), quality: wv("quality", 95),
     };
-    const sw = node.widgets?.find((x) => x.name === "saved");
     let j;
     try {
-      const r = await api.fetchApi("/roundtrip/save", { method: "POST", body: JSON.stringify(body) });
-      j = await r.json();
+      j = await (await api.fetchApi("/roundtrip/save", { method: "POST", body: JSON.stringify(body) })).json();
     } catch (e) {
       j = { ok: false, error: String(e) };
     }
-    if (sw) {
-      sw.value = j.ok ? `saved: ${j.path}` : `error: ${j.error || "save failed"}`;
-      node.setDirtyCanvas?.(true, true);
-    }
-    if (j.ok) node._rtRefreshTarget?.(); // next number is now taken
+    if (j.ok) {
+      toast("success", "Saved", j.path);
+      node._rtRefreshTarget?.(); // next number is now taken
+    } else toast("error", "Save failed", j.error || "unknown error");
   };
-  const btn1 = mk(`💾 save C${variant + 1} as _#`);
-  btn1.callback = () => doSave("");
-  const btn2 = mk(`💾 save C${variant + 1} as…`);
+  const stem = sourcePath ? String(sourcePath).replace(/\\/g, "/").split("/").pop().replace(/\.[^.]+$/, "") : "image";
+  const btn1 = mk("💾 save");
+  btn1.tooltip = node._rtTarget || "next free _# name next to the source";
+  btn1.callback = () => serverSave("");
+  const btn2 = mk("💾 save as…");
+  btn2.tooltip = "choose folder and name";
   btn2.callback = async () => {
-    // suggested name: source stem + "_edit"
-    const stem = sourcePath ? String(sourcePath).replace(/\\/g, "/").split("/").pop().replace(/\.[^.]+$/, "") : "image";
+    const suggested = (node._rtTarget ? String(node._rtTarget).replace(/\\/g, "/").split("/").pop() : "") || `${stem}_edit.png`;
+    if (typeof window.showSaveFilePicker === "function") {
+      // real file dialog (Chrome/Edge, secure context: localhost or https)
+      let handle;
+      try {
+        handle = await window.showSaveFilePicker({ id: "image-roundtrip", startIn: "pictures", suggestedName: suggested, types: PICK_TYPES });
+      } catch (e) {
+        if (e?.name !== "AbortError") toast("error", "Save as", String(e));
+        return;
+      }
+      try {
+        const blob = await previewBlob(entry, handle.name, wv("quality", 95));
+        const wr = await handle.createWritable();
+        await wr.write(blob);
+        await wr.close();
+        toast("success", "Saved", handle.name);
+      } catch (e) {
+        toast("error", "Save failed", String(e));
+      }
+      return;
+    }
+    // no file dialog (plain http on a LAN address): ask for a name, saved next to the source
     let name = "";
     const prompt = app.extensionManager?.dialog?.prompt;
-    if (typeof prompt === "function") {
-      name = await prompt({ title: "Save as", defaultValue: `${stem}_edit` });
-    } else {
-      name = window.prompt(`Save as (next to ${stem}):`, `${stem}_edit`);
-    }
-    if (name != null && name !== "") await doSave(String(name).trim());
+    if (typeof prompt === "function") name = await prompt({ title: "Save as (next to the source)", message: "File name", defaultValue: `${stem}_edit` });
+    else name = window.prompt("Save as (next to the source):", `${stem}_edit`);
+    if (name != null && String(name).trim() !== "") await serverSave(String(name).trim());
   };
   node._rtButtons = [btn1, btn2];
   node._rtRemoveButtons = () => {
@@ -400,8 +444,7 @@ app.registerExtension({
       const cmp = this.widgets?.find((w) => w.name === "comparer");
       if (cmp) cmp.setData(a, b);
       const saved = Array.isArray(message?.saved) ? message.saved : [];
-      const sw = this.widgets?.find((w) => w.name === "saved");
-      if (sw) sw.value = saved.length ? (saved.length > 1 ? `saved: ${saved[saved.length - 1]} (+${saved.length - 1})` : `saved: ${saved[0]}`) : "";
+      if (saved.length) toast("success", "Auto-saved", saved.length > 1 ? `${saved[saved.length - 1]} (+${saved.length - 1})` : saved[0]);
       // buttons for the selected creation (save _# / save as…)
       const sel = cmp?.selected ?? 0;
       if (b[sel]) addSaveButtons(this, b[sel], source, sel);
@@ -449,8 +492,6 @@ app.registerExtension({
     node.addCustomWidget(cmp);
     wirePointer(node, cmp);
     addTargetWidget(node);
-    // "saved: <path>" / "error: ..." feedback (both node types)
-    makeTextWidget(node, "saved");
     // target preview updates when suffix/save_as/format change
     const cw = node.widgets?.find((x) => x.name === "compare");
     if (cw) { const cb0 = cw.callback; cw.callback = (...a) => { cb0?.(...a); node.setDirtyCanvas?.(true, true); }; }
