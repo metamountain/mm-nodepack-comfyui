@@ -594,14 +594,9 @@ app.registerExtension({
           }
           return r;
         };
-        // only the source that is used is active: path set -> image picker + upload greyed out
-        const upw = node.widgets?.find((w) => w.name === "upload" || w.type === "button");
-        const sync = () => {
-          const usePath = String(pw.value || "").trim() !== "";
-          iw.disabled = usePath;
-          if (upw) upw.disabled = usePath;
-          node.setDirtyCanvas?.(true, true);
-        };
+        // picker + upload stay clickable even with a path set: choosing/uploading clears the path
+        // (the upload widget calls iw.callback too), so the path never has to be deleted by hand
+        const sync = () => node.setDirtyCanvas?.(true, true);
         // the thumbnail belongs to the picker; with a path it would show the wrong image
         // (after a run the node shows the path image from the backend)
         const clearThumb = () => {
