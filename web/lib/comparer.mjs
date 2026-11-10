@@ -1,13 +1,26 @@
 // Compare slider for Preview Image MM - loaded on demand (dynamic import) by mm_nodepack.js
 // the first time a Preview Image MM node is created. Slider logic adapted from
 // rgthree-comfy image_comparer.js (MIT). .mjs so ComfyUI does not load it as an extension.
+// Modes (button under the image, node property mm_compare): slide (rgthree "Slide"),
+// hold (rgthree "Click": original while the mouse button is held), off.
+import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
+
+const MODES = ["slide", "hold", "off"];
+const MODE_LABEL = { slide: "◧  slide compare", hold: "◉  hold to compare", off: "○  compare off" };
+
+export function compareMode(node) {
+  const m = node.properties?.mm_compare;
+  if (m === false) return "off";
+  return MODES.includes(m) ? m : "slide";
+}
 
 const LABEL = "rgba(170,170,170,.85)", LABEL_HI = "rgba(225,225,225,1)", DIM = "rgba(150,150,150,.6)";
 
 function loadImage(entry) {
   const img = new Image();
-  img.src = api.apiURL("/view?" + new URLSearchParams({ filename: entry.filename, subfolder: entry.subfolder || "", type: entry.type || "temp" }));
+  const q = new URLSearchParams({ filename: entry.filename, subfolder: entry.subfolder || "", type: entry.type || "temp" });
+  img.src = api.apiURL("/view?" + q + (app.getPreviewFormatParam?.() ?? "") + (app.getRandParam?.() ?? ""));
   return img;
 }
 // ---------------------------------------------------------------------------
@@ -36,7 +49,14 @@ export class ComparerWidget {
   mouse(e, pos) {
     const t = e?.type;
     if (t !== "pointerdown" && t !== "mousedown") return false;
-    return this.hit(pos);
+    if (this.hit(pos)) return true;
+    // hold mode: show the original while the button is held over the image (rgthree "Click")
+    const ib = this.imageBounds;
+    if (compareMode(this.node) === "hold" && ib && pos[1] >= ib.top && pos[1] <= ib.bottom) {
+      holdDown(this.node);
+      return true;
+    }
+    return false;
   }
 
   // click on the variant bar (C1 C2 ...) or on the compare toggle under the image
@@ -50,7 +70,7 @@ export class ComparerWidget {
     const tb = this.toggleBounds;
     if (tb && pos[0] >= tb.x && pos[0] <= tb.x + tb.w && pos[1] >= tb.y && pos[1] <= tb.y + tb.h) {
       const p = (this.node.properties ??= {});
-      p.mm_compare = p.mm_compare === false;   // display only: the original is always sent
+      p.mm_compare = MODES[(MODES.indexOf(compareMode(this.node)) + 1) % MODES.length];   // display only
       this.node.setDirtyCanvas?.(true, true);
       return true;
     }
@@ -131,10 +151,12 @@ export class ComparerWidget {
       });
       y += 16;
     }
-    const compare = node.properties?.mm_compare !== false;   // toggle under the image
+    const mode = compareMode(node);   // button under the image
+    const compare = mode !== "off";
     const haveA = !!this.imgA?.naturalWidth;
     const hasA = compare && haveA;
-    const over = !!node.isPointerOver && hasA;
+    const held = mode === "hold" && hasA && !!node._mmDown;
+    const over = mode === "slide" && !!node.isPointerOver && hasA;
     const cropX = over ? node.pointerOverPos?.[0] : null;
     const creation = b.length > 1 ? `CREATION ${this.selected + 1}` : "CREATION";
     // label line ABOVE the image (outside, subtle): left = original, right = creation
@@ -142,7 +164,7 @@ export class ComparerWidget {
       const leftShare = cropX != null ? cropX / W : 0;
       ctx.textAlign = "left";
       if (hasA) {
-        ctx.fillStyle = over && leftShare > 0.5 ? LABEL_HI : LABEL;
+        ctx.fillStyle = held || (over && leftShare > 0.5) ? LABEL_HI : LABEL;
         const sid = node._rtSrcId || node._rtSrcIdLive;
         ctx.fillText(sid ? `◀ ORIGINAL #${sid}` : "◀ ORIGINAL", 8, y + 3);
       } else if (compare && (node._rtNote || node._rtSrcNote)) {
@@ -150,15 +172,16 @@ export class ComparerWidget {
         ctx.fillText(node._rtNote || node._rtSrcNote, 8, y + 3);
       }
       ctx.textAlign = "right";
-      ctx.fillStyle = !over || leftShare <= 0.5 ? LABEL_HI : LABEL;
+      ctx.fillStyle = !held && (!over || leftShare <= 0.5) ? LABEL_HI : LABEL;
       ctx.fillText(creation + " ▶", W - 8, y + 3);
       y += 16;
     }
     ctx.restore();
     // creation full, original clipped up to the pointer -> original left of the line, creation right
     const reserve = this._reserve();
-    const r = this._drawImage(ctx, this.imgB, y, null, reserve);
+    const r = this._drawImage(ctx, held ? this.imgA : this.imgB, y, null, reserve);
     if (over) this._drawImage(ctx, this.imgA, y, cropX, reserve, true);
+    this.imageBounds = r;
     if (r) {
       // line directly under the image: compare toggle (only with an original) + sizes
       const sa = haveA ? `Original ${this.imgA.naturalWidth}×${this.imgA.naturalHeight} · ` : "";
@@ -168,7 +191,7 @@ export class ComparerWidget {
       ctx.textBaseline = "top";
       if (haveA) {
         // big centered toggle button directly under the image, sizes below it
-        const label = compare ? "◧  compare on" : "◧  compare off";
+        const label = MODE_LABEL[mode];
         ctx.font = "bold 13px Arial";
         const bw = Math.min(W - 16, Math.max(150, ctx.measureText(label).width + 32)), bh = 24;
         const bx = (W - bw) / 2, by = r.bottom + 4;
@@ -232,13 +255,14 @@ export class ComparerWidget {
       ctx.beginPath();
       ctx.moveTo(cropX, destY);
       ctx.lineTo(cropX, destY + destHeight);
-      ctx.strokeStyle = "rgba(255,255,255,.55)";
+      ctx.globalCompositeOperation = "difference";
+      ctx.strokeStyle = "rgba(255,255,255,1)";
       ctx.lineWidth = 1;
       ctx.stroke();
       if (handle) {
         ctx.beginPath();
-        ctx.arc(cropX, destY + destHeight / 2, 3, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(255,255,255,.85)";
+        ctx.arc(cropX, destY + destHeight / 2, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(255,255,255,1)";
         ctx.fill();
       }
     }
@@ -248,7 +272,45 @@ export class ComparerWidget {
   }
 }
 
+// rgthree setIsPointerDown: stays "down" until the canvas reports the button released
+function holdDown(node) {
+  node._mmDown = true;
+  node.setDirtyCanvas?.(true, false);
+  const tick = () => {
+    if (app.canvas?.pointer_is_down || app.canvas?.pointer?.isDown) return requestAnimationFrame(tick);
+    node._mmDown = false;
+    node.setDirtyCanvas?.(true, false);
+  };
+  requestAnimationFrame(tick);
+}
+
+async function copyImage(img) {
+  try {
+    const c = document.createElement("canvas");
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext("2d").drawImage(img, 0, 0);
+    const blob = await new Promise((r) => c.toBlob(r, "image/png"));
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+  } catch (e) {
+    console.warn("[MM Nodepack] copy image failed (clipboard needs localhost/https)", e);
+  }
+}
+
 export function wirePointer(node, widget) {
+  // right-click entries for the shown images. Not via node.imgs: that makes the frontend add its
+  // own $$canvas-image-preview widget below ours (unsafeUpdatePreviews -> showCanvasImagePreview).
+  const origMenu = node.getExtraMenuOptions;
+  node.getExtraMenuOptions = function (canvas, options) {
+    const r = origMenu?.apply(this, arguments);
+    const add = [];
+    if (widget.imgB?.naturalWidth) {
+      add.push({ content: "Open creation", callback: () => window.open(widget.imgB.src, "_blank") });
+      add.push({ content: "Copy creation", callback: () => copyImage(widget.imgB) });
+    }
+    if (widget.imgA?.naturalWidth) add.push({ content: "Open original", callback: () => window.open(widget.imgA.src, "_blank") });
+    if (add.length) options.unshift(...add, null);
+    return r;
+  };
   // pointer tracking for the slide compare (rgthree image_comparer.js:77-115)
   const origEnter = node.onMouseEnter;
   const origLeave = node.onMouseLeave;
@@ -262,6 +324,7 @@ export function wirePointer(node, widget) {
   node.onMouseLeave = (e) => {
     origLeave?.call(node, e);
     node.isPointerOver = false;
+    node._mmDown = false;
     node.setDirtyCanvas?.(true, false);
   };
   node.onMouseMove = (e, pos) => {
