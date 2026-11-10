@@ -419,6 +419,17 @@ def is_local_request(remote: str) -> bool:
         return False
 
 
+def dialog_available() -> bool:
+    """An OS file dialog can open here (Linux: a desktop session and zenity/kdialog; a headless
+    server or container has none -> the browser upload / save picker is used instead)."""
+    import shutil
+    import sys
+    if os.name == "nt" or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and bool(
+        shutil.which("zenity") or shutil.which("kdialog"))
+
+
 def file_dialog(mode: str, start_dir: str, name: str = "") -> str:
     """The OS file dialog, mode 'open' or 'save' (Windows: PowerShell, macOS: osascript,
     Linux: zenity/kdialog). Returns the chosen path, '' = cancelled."""
@@ -652,8 +663,8 @@ def register_routes():
         @PromptServer.instance.routes.post("/mm-nodepack/dialog")
         async def _dialog(request):
             # the OS open/save dialog on the ComfyUI computer -> real paths, no browser sandbox
-            if not is_local_request(request.remote):
-                return web.json_response({"ok": False, "local": False, "error": "the file dialog opens on the ComfyUI computer"}, status=403)
+            if not is_local_request(request.remote) or not dialog_available():
+                return web.json_response({"ok": False, "local": False, "error": "no file dialog on the ComfyUI computer"}, status=403)
             try:
                 data = await request.json()
                 import folder_paths
