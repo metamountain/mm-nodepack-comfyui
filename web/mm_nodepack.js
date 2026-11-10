@@ -370,7 +370,7 @@ app.registerExtension({
                 };
                 setPath(j.path);
                 // identical copies in several folders: the browser never tells which one -> say so
-                if (j.candidates?.length > 1) toast("warn", "Same image in several folders", `${j.candidates.join(" · ")} → use 📂 open… to pick the exact file`);
+                if (j.candidates?.length > 1) toast("warn", "Same image in several folders", `${j.candidates.join(" · ")} → use "choose file" to pick the exact one`);
               })
               .catch(() => {});
           }
@@ -379,26 +379,30 @@ app.registerExtension({
         // picker + upload stay clickable even with a path set: choosing/uploading clears the path
         // (the upload widget calls iw.callback too), so the path never has to be deleted by hand
         const sync = () => node.setDirtyCanvas?.(true, true);
-        // "open…": the OS file dialog (on the ComfyUI computer) -> the real path, no upload copy
-        const ob = node.addWidget("button", "📂 open…", null, async () => {
-          let j;
-          try {
-            j = await (await api.fetchApi("/mm-nodepack/dialog", { method: "POST", body: JSON.stringify({ mode: "open", path: pw.value || "" }) })).json();
-          } catch (e) { j = { ok: false, error: String(e) }; }
-          if (!j.ok) return toast("warn", "Open", j.error || "failed");
-          if (!j.path) return;   // cancelled
-          pw.value = j.path;
-          node._rtPathShown = "";
-          node.imgs = undefined;
-          if (j.view) {
-            const img = loadImage(j.view);
-            img.onload = () => { node._rtPathShown = j.path; node.imgs = [img]; node.imageIndex = 0; app.graph.setDirtyCanvas(true, true); };
-          }
-          node.graph?.change?.();
-          node.setDirtyCanvas?.(true, true);
-        });
-        ob.serialize = false;
-        ob.options = { ...(ob.options || {}), serialize: false };
+        // "choose file": the OS file dialog (browser on the ComfyUI computer) -> the real path at once,
+        // no upload copy. Browser on another computer: the normal upload, as before.
+        const upw = node.widgets?.find((w) => w.name === "upload" || w.type === "button");
+        if (upw) {
+          const upload = upw.callback;
+          upw.label = "choose file";
+          upw.callback = async function (...args) {
+            let j;
+            try {
+              j = await (await api.fetchApi("/mm-nodepack/dialog", { method: "POST", body: JSON.stringify({ mode: "open", path: pw.value || "" }) })).json();
+            } catch (e) { j = { ok: false, error: String(e) }; }
+            if (!j.ok) return j.local === false ? upload?.apply(this, args) : toast("error", "Choose file", j.error || "failed");
+            if (!j.path) return;   // cancelled
+            pw.value = j.path;
+            node._rtPathShown = "";
+            node.imgs = undefined;
+            if (j.view) {
+              const img = loadImage(j.view);
+              img.onload = () => { node._rtPathShown = j.path; node.imgs = [img]; node.imageIndex = 0; app.graph.setDirtyCanvas(true, true); };
+            }
+            node.graph?.change?.();
+            node.setDirtyCanvas?.(true, true);
+          };
+        }
         // the thumbnail belongs to the picker; with a path it would show the wrong image
         // (after a run the node shows the path image from the backend)
         const clearThumb = () => {
