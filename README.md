@@ -11,6 +11,8 @@ This pack gives you both with everything you need for editing images where they 
 - **Iterate.** **send to loader** puts the result back into the loader, so the next run edits the new image.
 - **One node instead of three.** Preview Image MM replaces Preview Image + Save Image + an image comparer.
 
+> **Prototype, still in the debugging phase.** Feedback and bug reports are very welcome. Feel free to comment or open an issue.
+
 ![send to loader](assets/send_to_loader.gif)
 
 *Flux.2 Klein edit: "add a cactus" → send → "make it blue" → send → "pink and white striped" → send.*
