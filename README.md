@@ -4,6 +4,7 @@
 This pack gives you both with everything you need for editing images where they live:
 
 - **Real paths.** "choose file" opens your system file dialog and keeps the real path. Nothing is copied to `input/`.
+- **Handy outputs.** `image`, `mask`, `width`, `height`, `path`, so you don't need a Get Image Size node. One `sync` link carries original, path, mask, size and format to the preview.
 - **Compare built in.** Original vs. result under the image: slide, hold or off. No extra comparer node.
 - **Save next to the source.** `house.png` → `house_1.png`, `house_2.png`, …, never overwrites.
   **save as…** opens the system dialog in the source folder.
