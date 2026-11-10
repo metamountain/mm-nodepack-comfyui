@@ -1,8 +1,14 @@
 # MM Nodepack
 
-Two small nodes for editing images in ComfyUI **where they live**: load an image with its real
-file path, compare the result with the original, and save it back next to the source
-(`house.png` → `house_1.png`, `house_2.png`, …) – or send it straight back into the loader and keep editing.
+**Load Image and Preview Image are the most used nodes in ComfyUI, and they deserve an overhaul.**
+This pack gives you both with everything you need for editing images where they live:
+
+- **Real paths.** "choose file" opens your system file dialog and keeps the real path. Nothing is copied to `input/`.
+- **Compare built in.** Original vs. result under the image: slide, hold or off. No extra comparer node.
+- **Save next to the source.** `house.png` → `house_1.png`, `house_2.png`, …, never overwrites.
+  **save as…** opens the system dialog in the source folder.
+- **Iterate.** **send to loader** puts the result back into the loader, so the next run edits the new image.
+- **One node instead of three.** Preview Image MM replaces Preview Image + Save Image + an image comparer.
 
 ![send to loader](assets/send_to_loader.gif)
 
