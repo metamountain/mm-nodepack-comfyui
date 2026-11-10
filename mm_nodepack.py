@@ -6,6 +6,7 @@ load_image_file, save_tensor, png_metadata, make_source) are unit-testable witho
 ComfyUI: folder_paths is only imported inside functions.
 """
 import json
+import asyncio
 import os
 
 import numpy as np
@@ -72,7 +73,7 @@ def _pick_free(base: str, ext: str, taken=()) -> str:
         n += 1
 
 
-_ORIGIN_CACHE = {}  # (upload path, mtime, size) -> folder of the original in output (or None)
+_ORIGIN_CACHE = {}  # (upload path, mtime, size) -> original file in output (or None)
 
 
 def _md5(p: str) -> str:
@@ -84,9 +85,30 @@ def _md5(p: str) -> str:
     return h.hexdigest()
 
 
-def find_origin(src: str, out_dir: str):
-    """An upload is a copy: find the original in the output tree (same name + same size,
-    same content if several match). Returns its folder or None. Cached per upload."""
+def _files_of_size(root: str, size: int) -> list:
+    """All files below `root` with exactly `size` bytes (scandir: sizes come with the listing)."""
+    hits, stack = [], [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.stat(follow_symlinks=False).st_size == size:
+                            hits.append(e.path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return hits
+
+
+def find_origin_file(src: str, out_dir: str):
+    """An upload is a copy: find the original file in the output tree. Same name + same size
+    first (content decides between several), else any file with the same size and content
+    (uploads renamed to 'image (3).png'). Pasted bitmaps have no original -> None. Cached."""
     try:
         st = os.stat(src)
     except OSError:
@@ -94,22 +116,22 @@ def find_origin(src: str, out_dir: str):
     key = (os.path.abspath(src), st.st_mtime, st.st_size)
     if key in _ORIGIN_CACHE:
         return _ORIGIN_CACHE[key]
-    name = os.path.basename(src)
-    hits = []
-    for root, _dirs, files in os.walk(out_dir):
-        if name in files:
-            p = os.path.join(root, name)
-            try:
-                if os.path.getsize(p) == st.st_size:
-                    hits.append(p)
-            except OSError:
-                pass
-    if len(hits) > 1:
+    same = _files_of_size(out_dir, st.st_size)
+    named = [p for p in same if os.path.basename(p) == os.path.basename(src)]
+    res = None
+    if len(named) == 1:
+        res = named[0]
+    elif same:
         want = _md5(src)
-        hits = [p for p in hits if _md5(p) == want] or hits[:1]
-    res = os.path.dirname(hits[0]) if hits else None
+        res = next((p for p in (named or same) if _md5(p) == want), None)
     _ORIGIN_CACHE[key] = res
     return res
+
+
+def find_origin(src: str, out_dir: str):
+    """Folder of the original of an upload (see find_origin_file) or None."""
+    f = find_origin_file(src, out_dir)
+    return os.path.dirname(f) if f else None
 
 
 def save_dir(src: str) -> str:
@@ -425,7 +447,8 @@ class MMLoadImage(io.ComfyNode):
     def validate_inputs(cls, image, path=""):
         p = _clean(path)
         if p and not os.path.isfile(os.path.abspath(p)):
-            return f"file not found: {os.path.abspath(p)}"
+            return (f"path points to a missing file (moved or deleted?): {os.path.abspath(p)} – "
+                    "pick or upload an image (that sets a new path) or clear the path field")
         return True
 
     @classmethod
@@ -557,7 +580,12 @@ def register_routes():
                 p = os.path.abspath(folder_paths.get_annotated_filepath(str(data.get("image", ""))))
                 if not os.path.isfile(p):
                     return web.json_response({"ok": False, "error": f"file not found: {p}"}, status=404)
-                return web.json_response({"ok": True, "path": p})
+                inp = os.path.abspath(folder_paths.get_input_directory())
+                if os.path.commonpath([inp, p]) == inp:
+                    # an upload is only a copy: show where the original lives ("" = pasted, unknown)
+                    o = await asyncio.to_thread(find_origin_file, p, folder_paths.get_output_directory())
+                    return web.json_response({"ok": True, "path": o or "", "file": p})
+                return web.json_response({"ok": True, "path": p, "file": p})
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 

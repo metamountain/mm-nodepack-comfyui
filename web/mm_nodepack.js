@@ -222,10 +222,12 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   const stem = sourcePath ? String(sourcePath).replace(/\\/g, "/").split("/").pop().replace(/\.[^.]+$/, "") : "image";
   const btn1 = mk("💾 save");
   btn1.tooltip = node._rtTarget || "next free _# name next to the source";
-  // pasted image (Ctrl+V -> ComfyUI/input/pasted/): no real home folder -> save behaves like save as
+  // no known home folder -> save behaves like save as: pasted images (Ctrl+V -> input/pasted/) and
+  // uploads whose original was not found (picking/uploading leaves the loader's path empty then)
   const isPasted = () => {
     const ln = findLoader(node)?.node;
     const lw = (name) => String(ln?.widgets?.find((x) => x.name === name)?.value ?? "");
+    if (ln && !lw("path").trim()) return true;
     const p = (sourcePath || lw("path") || lw("image")).replace(/\\/g, "/");
     return /(^|\/)pasted\//i.test(p);
   };
