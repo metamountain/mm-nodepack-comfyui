@@ -1,14 +1,14 @@
 [project]
-name = "comfyui-mm-nodes"
+name = "mm-nodepack-comfyui"
 description = "Load an image with its path, edit it, save it back next to the source (name_1, name_2 … or save as) – plus a preview node that saves single variants without a re-run."
 version = "0.1.0"
 license = { file = "LICENSE" }
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/metamountain/comfyui-mm-nodes"
+Repository = "https://github.com/metamountain/mm-nodepack-comfyui"
 
 [tool.comfy]
 PublisherId = "metamountain"
-DisplayName = "MM Nodes"
+DisplayName = "MM Nodepack"
 includes = []

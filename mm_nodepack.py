@@ -1,4 +1,4 @@
-"""comfyui-mm-nodes: load an image together with its path, edit it, and save the
+"""mm-nodepack-comfyui: load an image together with its path, edit it, and save the
 result next to the source (haus_1.png, haus_2.png, ... or "save as").
 
 V3 node API (comfy_api.latest). The pure helpers (next_target, resolve_source,
@@ -15,7 +15,7 @@ from PIL import Image, ImageOps, ImageSequence, PngImagePlugin
 from comfy_api.latest import io, ui
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
-CATEGORY = "metamountain/image"
+CATEGORY = "MM Nodepack"
 
 # The sync connection: one link carries everything the saver needs (NACHTRAG B):
 # {"path": abs. path, "image": IMAGE tensor (original), "mask": MASK,
@@ -376,7 +376,7 @@ def _preview_entries(tensors, cls) -> list:
 # Node 1: Load Image MM
 # ---------------------------------------------------------------------------
 
-ALIASES = ["mm", "metamountain", "mm nodes"]
+ALIASES = ["mm", "metamountain", "mm nodepack"]
 
 
 def _size_text(p: str, w: int, h: int) -> str:
@@ -539,7 +539,7 @@ def register_routes():
         from aiohttp import web
         from server import PromptServer
 
-        @PromptServer.instance.routes.post("/mm-nodes/target")
+        @PromptServer.instance.routes.post("/mm-nodepack/target")
         async def _target(request):
             data = await request.json()
             try:
@@ -559,7 +559,7 @@ def register_routes():
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 
-        @PromptServer.instance.routes.post("/mm-nodes/save")
+        @PromptServer.instance.routes.post("/mm-nodepack/save")
         async def _save(request):
             data = await request.json()
             try:
@@ -615,4 +615,4 @@ def register_routes():
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
     except Exception as e:  # noqa: BLE001 - without a server (unit tests) no route
-        print(f"[metamountain.MMNodes] routes not registered: {e}")
+        print(f"[metamountain.MMNodepack] routes not registered: {e}")

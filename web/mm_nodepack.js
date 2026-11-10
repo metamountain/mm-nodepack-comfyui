@@ -1,4 +1,4 @@
-// MM Nodes (metamountain/image): target preview, per-variant save buttons,
+// MM Nodepack (category "MM Nodepack"): target preview, per-variant save buttons,
 // and a compare slider (original vs. result).
 // slider logic adapted from rgthree-comfy image_comparer.js (MIT)
 import { app } from "../../scripts/app.js";
@@ -252,7 +252,7 @@ function makeTextWidget(node, name) {
   return w;
 }
 
-// Which Load Image MM feeds this preview (same rules as find_loader in mm_nodes.py):
+// Which Load Image MM feeds this preview (same rules as find_loader in mm_nodepack.py):
 // sync link > source "#id" > auto (the one loader upstream of images, else the only loader).
 function findLoader(node) {
   const g = node.graph || app.graph;
@@ -361,7 +361,7 @@ function addTargetWidget(node) {
       setTarget("output/preview_# (no Load Image MM found)");
       return;
     }
-    api.fetchApi("/mm-nodes/target", { method: "POST", body: JSON.stringify(body) })
+    api.fetchApi("/mm-nodepack/target", { method: "POST", body: JSON.stringify(body) })
       .then((r) => r.json())
       .then((j) => {
         setTarget(j.ok ? j.target : (j.error || "target?"));
@@ -411,7 +411,7 @@ function wirePointer(node, widget) {
 function toast(severity, summary, detail) {
   const t = app.extensionManager?.toast;
   if (t?.add) t.add({ severity, summary, detail, life: severity === "error" ? 6000 : 3000 });
-  else console[severity === "error" ? "error" : "log"](`[MM Nodes] ${summary}: ${detail}`);
+  else console[severity === "error" ? "error" : "log"](`[MM Nodepack] ${summary}: ${detail}`);
 }
 
 const PICK_TYPES = [
@@ -460,7 +460,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     };
     let j;
     try {
-      j = await (await api.fetchApi("/mm-nodes/save", { method: "POST", body: JSON.stringify(body) })).json();
+      j = await (await api.fetchApi("/mm-nodepack/save", { method: "POST", body: JSON.stringify(body) })).json();
     } catch (e) {
       j = { ok: false, error: String(e) };
     }
@@ -482,7 +482,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
       // real file dialog (Chrome/Edge, secure context: localhost or https)
       let handle;
       try {
-        handle = await window.showSaveFilePicker({ id: "mm-nodes", startIn: "pictures", suggestedName: suggested, types: PICK_TYPES });
+        handle = await window.showSaveFilePicker({ id: "mm-nodepack", startIn: "pictures", suggestedName: suggested, types: PICK_TYPES });
       } catch (e) {
         if (e?.name !== "AbortError") toast("error", "Save as", String(e));
         return;
@@ -542,7 +542,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
 // Extension
 // ---------------------------------------------------------------------------
 app.registerExtension({
-  name: "metamountain.MMNodes",
+  name: "metamountain.MMNodepack",
   beforeRegisterNodeDef(nodeType, nodeData) {
     if (!SAVE_NODES.has(nodeData?.name)) return;
 

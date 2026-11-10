@@ -1,11 +1,11 @@
-# comfyui-mm-nodes
+# mm-nodepack-comfyui
 
 Load an image **with its path**, edit it, and save the result **next to the source** –
 `haus.png` → `haus_1.png`, `haus_2.png`, … – or anywhere via "save as". A preview node
 shows the variants with a compare slider (original vs. result) and saves single images
 per button, without a new run.
 
-Category: `metamountain/image`.
+Category: `MM Nodepack`.
 
 ## Nodes
 
@@ -34,12 +34,12 @@ Load Image (Path) [path: D:\photos\haus.png]
 
 ## Routes
 
-- `POST /mm-nodes/target` `{path?, image?, suffix, save_as, format}` → `{ok, target}` (compute only).
-- `POST /mm-nodes/save` `{filename, subfolder, type, source, suffix, save_as, format, quality}` →
+- `POST /mm-nodepack/target` `{path?, image?, suffix, save_as, format}` → `{ok, target}` (compute only).
+- `POST /mm-nodepack/save` `{filename, subfolder, type, source, suffix, save_as, format, quality}` →
   `{ok, path}` – re-saves a preview image (temp/output) next to the source.
 
 ## Tests
 
 ```
-D:\ComfyUI_windows_portable\python_embeded\python.exe tests\test_mm_nodes.py
+D:\ComfyUI_windows_portable\python_embeded\python.exe tests\test_mm_nodepack.py
 ```

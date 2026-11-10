@@ -1,7 +1,7 @@
-"""Unit tests for the pure helpers of mm_nodes (no ComfyUI server needed).
+"""Unit tests for the pure helpers of mm_nodepack (no ComfyUI server needed).
 
 Run:
-  D:\\ComfyUI_windows_portable\\python_embeded\\python.exe D:\\Coding\\Comfyui\\comfyui-mm-nodes\\tests\\test_mm_nodes.py
+  D:\\ComfyUI_windows_portable\\python_embeded\\python.exe D:\\Coding\\Comfyui\\mm-nodepack-comfyui\\tests\\test_mm_nodepack.py
 """
 import os
 import sys
@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from mm_nodes import (  # noqa: E402
+from mm_nodepack import (  # noqa: E402
     IMAGE_EXTS,
     find_loader,
     source_from_prompt,
