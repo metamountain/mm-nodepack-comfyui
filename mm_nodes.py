@@ -296,9 +296,13 @@ def _targets(images, source, suffix, save_as, fmt) -> list:
         else:
             base = os.path.join(src_dir, stem + (suffix or ""))
     else:
-        # no source: output dir, stem "preview"
+        # no source: output dir; save_as = name/subfolder like SaveImage's filename_prefix, else "preview"
         import folder_paths
-        base = os.path.join(folder_paths.get_output_directory(), "preview" + (suffix or ""))
+        out_dir = os.path.abspath(folder_paths.get_output_directory())
+        stem = _clean(save_as).replace("\\", "/").strip("/") or "preview"
+        base = os.path.abspath(os.path.join(out_dir, stem + (suffix or "")))
+        if os.path.commonpath([out_dir, base]) != out_dir:  # no escape from output
+            base = os.path.join(out_dir, "preview" + (suffix or ""))
         ext = ".png" if fmt == "same as source" else _FMT_EXT.get(fmt, ".png")
     taken = []
     out = []

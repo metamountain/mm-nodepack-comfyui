@@ -20,6 +20,7 @@ from mm_nodes import (  # noqa: E402
     make_source,
     next_target,
     save_dir,
+    _targets,
     save_tensor,
 )
 
@@ -112,6 +113,11 @@ def main():
         check(save_dir(up) == os.path.join(outp, "pasted"), "save_dir: upload -> output/pasted")
         check(next_target(up) == os.path.join(outp, "pasted", "up_1.png"), "next_target: upload -> output")
         check(save_dir(src) == d, "save_dir: own folder stays")
+        imgs = [torch.zeros(4, 4, 3)] * 2
+        tg = _targets(imgs, None, "_#", "flux/bild", "same as source")
+        check(tg == [os.path.join(outp, "flux", "bild_1.png"), os.path.join(outp, "flux", "bild_2.png")], "no source: save_as as prefix -> output/flux/bild_1,_2")
+        check(_targets(imgs[:1], None, "_#", "", "png") == [os.path.join(outp, "preview_1.png")], "no source, no save_as -> output/preview_1")
+        check(_targets(imgs[:1], None, "_#", "../../x", "png") == [os.path.join(outp, "preview_1.png")], "no source: no escape from output")
         del sys.modules["folder_paths"]
 
         # wireless source lookup (find_loader) on an API prompt
