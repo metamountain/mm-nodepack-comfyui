@@ -516,6 +516,16 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     if (!pw) return;
     pw.value = j.path;
     pw.callback?.(j.path);
+    // show the sent creation in the loader right away (the file = this preview image)
+    const img = loadImage(entry);
+    img.onload = () => {
+      loader._rtPathShown = j.path;
+      loader.imgs = [img];
+      loader.imageIndex = 0;
+      const info = loader.widgets?.find((w) => w.name === "info");
+      if (info) info.value = `${img.naturalWidth}×${img.naturalHeight}`;
+      app.graph.setDirtyCanvas(true, true);
+    };
     loader.setDirtyCanvas?.(true, true);
     toast("info", `Loader #${loader.id}`, j.path);
   };
