@@ -72,15 +72,57 @@ def _pick_free(base: str, ext: str, taken=()) -> str:
         n += 1
 
 
+_ORIGIN_CACHE = {}  # (upload path, mtime, size) -> folder of the original in output (or None)
+
+
+def _md5(p: str) -> str:
+    import hashlib
+    h = hashlib.md5()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def find_origin(src: str, out_dir: str):
+    """An upload is a copy: find the original in the output tree (same name + same size,
+    same content if several match). Returns its folder or None. Cached per upload."""
+    try:
+        st = os.stat(src)
+    except OSError:
+        return None
+    key = (os.path.abspath(src), st.st_mtime, st.st_size)
+    if key in _ORIGIN_CACHE:
+        return _ORIGIN_CACHE[key]
+    name = os.path.basename(src)
+    hits = []
+    for root, _dirs, files in os.walk(out_dir):
+        if name in files:
+            p = os.path.join(root, name)
+            try:
+                if os.path.getsize(p) == st.st_size:
+                    hits.append(p)
+            except OSError:
+                pass
+    if len(hits) > 1:
+        want = _md5(src)
+        hits = [p for p in hits if _md5(p) == want] or hits[:1]
+    res = os.path.dirname(hits[0]) if hits else None
+    _ORIGIN_CACHE[key] = res
+    return res
+
+
 def save_dir(src: str) -> str:
     """Folder for saves of `src`: next to the file – except uploads in ComfyUI/input
-    (only a copy of the user's file): those go to ComfyUI/output (same subfolder)."""
+    (only a copy of the user's file): those go next to the original in ComfyUI/output when it
+    is found there (same name + content), else to ComfyUI/output (same subfolder)."""
     d = os.path.dirname(os.path.abspath(src))
     try:
         import folder_paths
         inp = os.path.abspath(folder_paths.get_input_directory())
         if os.path.commonpath([inp, os.path.abspath(src)]) == inp:
-            return os.path.normpath(os.path.join(folder_paths.get_output_directory(), os.path.relpath(d, inp)))
+            out = folder_paths.get_output_directory()
+            return find_origin(src, out) or os.path.normpath(os.path.join(out, os.path.relpath(d, inp)))
     except Exception:  # noqa: BLE001 – no ComfyUI (unit tests) or other drive
         pass
     return d

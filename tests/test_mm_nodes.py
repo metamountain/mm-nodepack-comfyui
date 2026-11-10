@@ -113,6 +113,12 @@ def main():
         check(save_dir(up) == os.path.join(outp, "pasted"), "save_dir: upload -> output/pasted")
         check(next_target(up) == os.path.join(outp, "pasted", "up_1.png"), "next_target: upload -> output")
         check(save_dir(src) == d, "save_dir: own folder stays")
+        # upload whose original lies in the output tree -> save next to the original (same content wins)
+        os.makedirs(os.path.join(outp, "Moods")); os.makedirs(os.path.join(outp, "Other"))
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(os.path.join(inp, "orig.png"))
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(os.path.join(outp, "Moods", "orig.png"))
+        Image.new("RGB", (4, 4), (9, 9, 9)).save(os.path.join(outp, "Other", "orig.png"))
+        check(save_dir(os.path.join(inp, "orig.png")) == os.path.join(outp, "Moods"), "save_dir: upload -> folder of the original (content match)")
         imgs = [torch.zeros(4, 4, 3)] * 2
         tg = _targets(imgs, None, "_#", "flux/bild", "same as source")
         check(tg == [os.path.join(outp, "flux", "bild_1.png"), os.path.join(outp, "flux", "bild_2.png")], "no source: save_as as prefix -> output/flux/bild_1,_2")
