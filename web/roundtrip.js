@@ -571,9 +571,18 @@ app.registerExtension({
       node.onExecuted = function (message) {
         origExec?.apply(this, arguments);
         info.value = Array.isArray(message?.info) ? message.info[0] || "" : "";
+        // the backend previews the path file -> this thumbnail is the right one
+        this._rtPathShown = Array.isArray(message?.images) && message.images.length ? String(this.widgets?.find((w) => w.name === "path")?.value || "") : "";
         this.setDirtyCanvas?.(true, true);
       };
       const origFg = node.onDrawForeground;
+      const origBg = node.onDrawBackground;
+      node.onDrawBackground = function () {
+        // path set: drop the picker's thumbnail (it loads async, after the path was typed)
+        const pv = String(this.widgets?.find((w) => w.name === "path")?.value || "").trim();
+        if (pv && this.imgs?.length && this._rtPathShown !== pv) this.imgs = undefined;
+        return origBg?.apply(this, arguments);
+      };
       node.onDrawForeground = function (ctx) {
         origFg?.apply(this, arguments);
         const t = String(info.value || "").split(" · ")[0];
