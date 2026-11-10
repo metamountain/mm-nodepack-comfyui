@@ -284,8 +284,52 @@ function findLoader(node) {
   if (found.size === 1) return { node: [...found][0], note: "" };
   if (!found.size && loaders.length === 1) return { node: loaders[0], note: "" };
   const many = found.size > 1 ? [...found] : loaders;
-  if (many.length > 1) return { node: null, note: `several loaders (${many.map((n) => "#" + n.id).join(" ")}) – set source` };
+  if (many.length > 1) return { node: null, many, note: `several loaders (${many.map((n) => "#" + n.id).join(" ")}) – set source` };
   return { node: null, note: "" };
+}
+
+function loaderLabel(n) {
+  const w = (name) => String(n.widgets?.find((x) => x.name === name)?.value ?? "");
+  const f = (w("path") || w("image")).replace(/\\/g, "/").split("/").pop();
+  return `#${n.id}  ${f}`;
+}
+
+// last pointer position (the button callback has no DOM event to anchor the menu)
+const lastPtr = { clientX: 200, clientY: 200 };
+window.addEventListener("pointerdown", (e) => { lastPtr.clientX = e.clientX; lastPtr.clientY = e.clientY; }, true);
+
+// ambiguous source: ask once with a small menu, remember the choice in the 'source' widget
+function chooseLoader(node, many) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (n) => { if (!done) { done = true; resolve(n); } };
+    const items = many.map((n) => ({ content: loaderLabel(n), callback: () => {
+      const sw = node.widgets?.find((w) => w.name === "source");
+      if (sw) { sw.value = `#${n.id}`; sw.callback?.(sw.value); }
+      node.setDirtyCanvas?.(true, true);
+      finish(n);
+    } }));
+    // open after the click has finished, else its pointerup closes the menu at once
+    setTimeout(() => {
+      try {
+        const ev = new MouseEvent("contextmenu", { clientX: lastPtr.clientX, clientY: lastPtr.clientY });
+        new LiteGraph.ContextMenu(items, { title: "which Load Image MM?", event: ev, callback: () => {} });
+      } catch (e) {
+        toast("error", "Choose source", String(e));
+        finish(null);
+      }
+    }, 150);
+    // closed without a choice -> give up after a while
+    setTimeout(() => finish(null), 30000);
+  });
+}
+
+async function resolveLoader(node) {
+  const r = findLoader(node);
+  if (r.node) return r.node;
+  if (r.many?.length > 1) return await chooseLoader(node, r.many);
+  toast("error", "No source", "no Load Image MM found – add one or set source");
+  return null;
 }
 
 function sourceFromNode(node) {
@@ -401,8 +445,15 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   };
   const wv = (name, d) => node.widgets?.find((x) => x.name === name)?.value ?? d;
   // server side: next free name next to the source (never overwrites)
-  const serverSave = async (saveAs) => {
+  const serverSave = async (saveAs, loader) => {
+    if (!sourcePath && !loader) {
+      loader = await resolveLoader(node);
+      if (!loader) return { ok: false };
+    }
+    const lw = (name) => String(loader?.widgets?.find((x) => x.name === name)?.value ?? "");
     const body = {
+      image: sourcePath ? "" : lw("image"),
+      path: sourcePath ? "" : lw("path"),
       filename: entry.filename, subfolder: entry.subfolder || "", type: entry.type || "temp",
       source: sourcePath, suffix: wv("suffix", "_#"), save_as: saveAs,
       format: wv("format", "same as source"), quality: wv("quality", 95),
@@ -457,12 +508,9 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   const btn3 = mk("↩ send to loader");
   btn3.tooltip = "save as _# and load it in the Load Image MM (next run works on this creation)";
   btn3.callback = async () => {
-    const loader = findLoader(node).node;
-    if (!loader) {
-      toast("error", "Send to loader", node._rtSrcNote || "no Load Image MM found – set source");
-      return;
-    }
-    const j = await serverSave("");
+    const loader = await resolveLoader(node);
+    if (!loader) return;
+    const j = await serverSave("", loader);
     if (!j?.ok) return;
     const pw = loader.widgets?.find((w) => w.name === "path");
     if (!pw) return;
@@ -611,6 +659,7 @@ app.registerExtension({
       const cb = w.callback;
       w.callback = (...a) => {
         cb?.(...a);
+        if (name === "source") node._rtNote = "";  // the run's note is outdated now
         node._rtRefreshTarget?.();
       };
     }

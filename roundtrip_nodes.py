@@ -249,8 +249,8 @@ def find_loader(prompt, my_id, select="auto"):
     if not found and len(loaders) == 1:
         return loaders[0], ""
     if len(found) > 1 or len(loaders) > 1:
-        ids = ", ".join("#" + str(k).split(":")[-1] for k in (found or loaders))
-        return None, f"several Load Image MM ({ids}) – set source to one number"
+        ids = " ".join("#" + str(k).split(":")[-1] for k in (found or loaders))
+        return None, f"several loaders ({ids}) – set source"
     return None, ""
 
 
@@ -520,6 +520,9 @@ def register_routes():
                 if fmt not in ("same as source",) and fmt not in _FMT_EXT:
                     return web.json_response({"ok": False, "error": f"bad format: {fmt}"}, status=400)
                 src = _clean(str(data.get("source", "")))
+                if not src and (_clean(str(data.get("path", ""))) or str(data.get("image", ""))):
+                    # the run had no source: the loader the user picked (its path / upload name)
+                    src = resolve_source(str(data.get("image", "")), str(data.get("path", "")))
                 if not src:
                     src = os.path.join(folder_paths.get_output_directory(), "preview.png")
                 else:
