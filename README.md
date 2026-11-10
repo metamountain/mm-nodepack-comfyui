@@ -1,4 +1,4 @@
-# comfyui-image-roundtrip
+# comfyui-mm-nodes
 
 Load an image **with its path**, edit it, and save the result **next to the source** –
 `haus.png` → `haus_1.png`, `haus_2.png`, … – or anywhere via "save as". A preview node
@@ -12,8 +12,8 @@ Category: `metamountain/image`.
 | Node | What it does |
 |---|---|
 | **Load Image (Path)** | Loads an image by upload (ComfyUI/input) or full file path (`path` wins). Outputs `source` (sync connection: path, original image, mask, size, format), `image`, `mask`, `path` (resolved absolute path). |
-| **Save Image (Roundtrip)** | Saves every image of the batch next to the source: `stem + suffix + ext`. `suffix` default `_#` (`#` = next free number: `haus_1`, `haus_2`, …). `save_as` (empty = next to source) accepts a name or a full path. Format: same as source / png / jpg / webp. Compares the result with the original (slide on the image). |
-| **Preview & Save (Roundtrip)** | Previews the variants (slide compare with the original) and offers `💾 save _#` / `💾 save as…` buttons for the selected variant (B1, B2, … bar). Saving goes through the server, no new run needed. |
+| **Preview Image MM (auto_save)** | Saves every image of the batch next to the source: `stem + suffix + ext`. `suffix` default `_#` (`#` = next free number: `haus_1`, `haus_2`, …). `save_as` (empty = next to source) accepts a name or a full path. Format: same as source / png / jpg / webp. Compares the result with the original (slide on the image). |
+| **Preview Image MM** | Previews the variants (slide compare with the original) and offers `💾 save _#` / `💾 save as…` buttons for the selected variant (B1, B2, … bar). Saving goes through the server, no new run needed. |
 
 ## Naming rules
 
@@ -28,18 +28,18 @@ Category: `metamountain/image`.
 
 ```
 Load Image (Path) [path: D:\photos\haus.png]
-  └─ source ──▶ Save Image (Roundtrip) [suffix: _#]   → D:\photos\haus_1.png
+  └─ source ──▶ Preview Image MM (auto_save) [suffix: _#]   → D:\photos\haus_1.png
   └─ image ──▶ (your edit nodes) ──▶ images
 ```
 
 ## Routes
 
-- `POST /roundtrip/target` `{path?, image?, suffix, save_as, format}` → `{ok, target}` (compute only).
-- `POST /roundtrip/save` `{filename, subfolder, type, source, suffix, save_as, format, quality}` →
+- `POST /mm-nodes/target` `{path?, image?, suffix, save_as, format}` → `{ok, target}` (compute only).
+- `POST /mm-nodes/save` `{filename, subfolder, type, source, suffix, save_as, format, quality}` →
   `{ok, path}` – re-saves a preview image (temp/output) next to the source.
 
 ## Tests
 
 ```
-D:\ComfyUI_windows_portable\python_embeded\python.exe tests\test_roundtrip.py
+D:\ComfyUI_windows_portable\python_embeded\python.exe tests\test_mm_nodes.py
 ```

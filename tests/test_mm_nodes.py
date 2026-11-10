@@ -1,7 +1,7 @@
-"""Unit tests for the pure helpers of roundtrip_nodes (no ComfyUI server needed).
+"""Unit tests for the pure helpers of mm_nodes (no ComfyUI server needed).
 
 Run:
-  D:\\ComfyUI_windows_portable\\python_embeded\\python.exe D:\\Coding\\Comfyui\\comfyui-image-roundtrip\\tests\\test_roundtrip.py
+  D:\\ComfyUI_windows_portable\\python_embeded\\python.exe D:\\Coding\\Comfyui\\comfyui-mm-nodes\\tests\\test_mm_nodes.py
 """
 import os
 import sys
@@ -12,13 +12,14 @@ import torch
 from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from roundtrip_nodes import (  # noqa: E402
+from mm_nodes import (  # noqa: E402
     IMAGE_EXTS,
     find_loader,
     source_from_prompt,
     load_image_file,
     make_source,
     next_target,
+    save_dir,
     save_tensor,
 )
 
@@ -98,25 +99,40 @@ def main():
 
         check(IMAGE_EXTS == (".png", ".jpg", ".jpeg", ".webp"), "IMAGE_EXTS")
 
+        # uploads in ComfyUI/input are saved to ComfyUI/output (fake folder_paths)
+        import types
+        fp = types.ModuleType("folder_paths")
+        inp, outp = os.path.join(d, "input"), os.path.join(d, "output")
+        os.makedirs(os.path.join(inp, "pasted"))
+        fp.get_input_directory = lambda: inp
+        fp.get_output_directory = lambda: outp
+        sys.modules["folder_paths"] = fp
+        up = os.path.join(inp, "pasted", "up.png")
+        Image.new("RGB", (4, 4)).save(up)
+        check(save_dir(up) == os.path.join(outp, "pasted"), "save_dir: upload -> output/pasted")
+        check(next_target(up) == os.path.join(outp, "pasted", "up_1.png"), "next_target: upload -> output")
+        check(save_dir(src) == d, "save_dir: own folder stays")
+        del sys.modules["folder_paths"]
+
         # wireless source lookup (find_loader) on an API prompt
-        L = {"class_type": "RoundtripLoadImage", "inputs": {"image": "x.png", "path": src}}
+        L = {"class_type": "MMLoadImage", "inputs": {"image": "x.png", "path": src}}
         pr = {"5": L, "6": {"class_type": "ImageInvert", "inputs": {"image": ["5", 1]}},
-              "7": {"class_type": "RoundtripPreviewSave", "inputs": {"images": ["6", 0]}}}
+              "7": {"class_type": "MMPreviewImage", "inputs": {"images": ["6", 0]}}}
         check(find_loader(pr, "7", "auto") == ("5", ""), "auto: loader upstream")
-        pr2 = dict(pr, **{"9": dict(L), "8": {"class_type": "RoundtripPreviewSave", "inputs": {"images": ["6", 0]}}})
+        pr2 = dict(pr, **{"9": dict(L), "8": {"class_type": "MMPreviewImage", "inputs": {"images": ["6", 0]}}})
         check(find_loader(pr2, "8", "auto")[0] == "5", "auto: upstream wins over a second loader")
         pr3 = dict(pr2, **{"10": {"class_type": "EmptyImage", "inputs": {}},
-                           "11": {"class_type": "RoundtripPreviewSave", "inputs": {"images": ["10", 0]}}})
+                           "11": {"class_type": "MMPreviewImage", "inputs": {"images": ["10", 0]}}})
         lid, note = find_loader(pr3, "11", "auto")
         check(lid is None and "#5" in note and "#9" in note, f"auto: ambiguous -> note '{note}'")
         check(find_loader(pr3, "11", "#9") == ("9", ""), "select #9")
         check(find_loader({"3:9": L, "4": {"class_type": "X", "inputs": {}}}, "4", "9")[0] == "3:9", "select inside subgraph")
         check(find_loader(pr3, "11", "#42")[0] is None, "select unknown number -> None")
         one = {"5": L, "10": {"class_type": "EmptyImage", "inputs": {}},
-               "11": {"class_type": "RoundtripPreviewSave", "inputs": {"images": ["10", 0]}}}
+               "11": {"class_type": "MMPreviewImage", "inputs": {"images": ["10", 0]}}}
         check(find_loader(one, "11", "auto")[0] == "5", "auto: only loader in the workflow")
         check(source_from_prompt(pr, "5")["path"] == os.path.abspath(src), "source_from_prompt path")
-        linked = {"5": {"class_type": "RoundtripLoadImage", "inputs": {"image": "x.png", "path": ["2", 0]}}}
+        linked = {"5": {"class_type": "MMLoadImage", "inputs": {"image": "x.png", "path": ["2", 0]}}}
         check(source_from_prompt(linked, "5") is None, "source_from_prompt: linked path -> None")
 
     print("all ok")

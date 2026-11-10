@@ -1,4 +1,4 @@
-"""comfyui-image-roundtrip: load an image together with its path, edit it, and save the
+"""comfyui-mm-nodes: load an image together with its path, edit it, and save the
 result next to the source (haus_1.png, haus_2.png, ... or "save as").
 
 V3 node API (comfy_api.latest). The pure helpers (next_target, resolve_source,
@@ -20,7 +20,7 @@ CATEGORY = "metamountain/image"
 # The sync connection: one link carries everything the saver needs (NACHTRAG B):
 # {"path": abs. path, "image": IMAGE tensor (original), "mask": MASK,
 #  "width": int, "height": int, "format": source extension, "name": stem}
-SOURCE = io.Custom("ROUNDTRIP_SOURCE")
+SOURCE = io.Custom("MM_SYNC")
 
 _FMT_EXT = {"png": ".png", "jpg": ".jpg", "webp": ".webp"}
 
@@ -72,6 +72,20 @@ def _pick_free(base: str, ext: str, taken=()) -> str:
         n += 1
 
 
+def save_dir(src: str) -> str:
+    """Folder for saves of `src`: next to the file – except uploads in ComfyUI/input
+    (only a copy of the user's file): those go to ComfyUI/output (same subfolder)."""
+    d = os.path.dirname(os.path.abspath(src))
+    try:
+        import folder_paths
+        inp = os.path.abspath(folder_paths.get_input_directory())
+        if os.path.commonpath([inp, os.path.abspath(src)]) == inp:
+            return os.path.normpath(os.path.join(folder_paths.get_output_directory(), os.path.relpath(d, inp)))
+    except Exception:  # noqa: BLE001 – no ComfyUI (unit tests) or other drive
+        pass
+    return d
+
+
 def next_target(source: str, suffix: str = "_#", save_as: str = "", fmt: str = "same as source") -> str:
     """Absolute target path for the next saved image. Never overwrites.
 
@@ -87,7 +101,7 @@ def next_target(source: str, suffix: str = "_#", save_as: str = "", fmt: str = "
     src = os.path.abspath(src)
     if not os.path.isfile(src):
         raise ValueError(f"next_target: source not found: {src}")
-    src_dir = os.path.dirname(src)
+    src_dir = save_dir(src)
     stem = os.path.splitext(os.path.basename(src))[0]
     ext = _ext_for(src, fmt)
     sa = _clean(save_as)
@@ -141,7 +155,7 @@ def load_image_file(p: str):
 
 
 def make_source(path: str) -> dict:
-    """Build the ROUNDTRIP_SOURCE dict from a file (NACHTRAG B/D)."""
+    """Build the MM_SYNC dict from a file (NACHTRAG B/D)."""
     p = os.path.abspath(path)
     if not os.path.isfile(p):
         raise ValueError(f"source file not found: {p}")
@@ -211,13 +225,13 @@ def _default_source() -> dict:
 
 
 def _resolve_source_path(source) -> str:
-    """The source path from a ROUNDTRIP_SOURCE dict, else the preview fallback."""
+    """The source path from a MM_SYNC dict, else the preview fallback."""
     if source is not None and source.get("path"):
         return str(source["path"])
     return _default_source()["path"]
 
 
-LOADER_ID = "RoundtripLoadImage"
+LOADER_ID = "MMLoadImage"
 
 
 def find_loader(prompt, my_id, select="auto"):
@@ -255,7 +269,7 @@ def find_loader(prompt, my_id, select="auto"):
 
 
 def source_from_prompt(prompt, loader_id):
-    """ROUNDTRIP_SOURCE dict of a loader read from the prompt (its image/path widgets)."""
+    """MM_SYNC dict of a loader read from the prompt (its image/path widgets)."""
     inp = (prompt.get(str(loader_id)) or {}).get("inputs") or {}
     image, path = inp.get("image", ""), inp.get("path", "")
     if not isinstance(image, str) or not isinstance(path, str):
@@ -269,7 +283,7 @@ def _targets(images, source, suffix, save_as, fmt) -> list:
     numbers (the files do not exist on disk while they are computed)."""
     if source is not None and source.get("path"):
         src = os.path.abspath(str(source["path"]))
-        src_dir = os.path.dirname(src)
+        src_dir = save_dir(src)
         stem = str(source.get("name") or os.path.splitext(os.path.basename(src))[0])
         ext = _ext_for(src, fmt)
         sa = _clean(save_as)
@@ -316,7 +330,7 @@ def _preview_entries(tensors, cls) -> list:
 # Node 1: Load Image MM
 # ---------------------------------------------------------------------------
 
-ALIASES = ["mm", "metamountain", "roundtrip"]
+ALIASES = ["mm", "metamountain", "mm nodes"]
 
 
 def _size_text(p: str, w: int, h: int) -> str:
@@ -328,11 +342,11 @@ def _size_text(p: str, w: int, h: int) -> str:
     return f"{w}×{h} · {os.path.splitext(p)[1].lstrip('.').lower()} · {size}"
 
 
-class RoundtripLoadImage(io.ComfyNode):
+class MMLoadImage(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="RoundtripLoadImage",
+            node_id="MMLoadImage",
             display_name="Load Image MM",
             category=CATEGORY,
             description="Load an image by upload or full file path. 'sync' carries path, original image, mask, "
@@ -396,16 +410,17 @@ class RoundtripLoadImage(io.ComfyNode):
 FORMATS = ["same as source", "png", "jpg", "webp"]
 
 
-class RoundtripPreviewSave(io.ComfyNode):
+class MMPreviewImage(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="RoundtripPreviewSave",
+            node_id="MMPreviewImage",
             display_name="Preview Image MM",
             category=CATEGORY,
             is_output_node=True,
             description="Preview the creations, compare them with the original (slider) and save the selected one "
-                        "next to the source per button (name_1, name_2 … or save as) – or every run with auto_save.",
+                        "next to the source per button (name_1, name_2 … or save as) – or every run with auto_save. "
+                        "Uploads (ComfyUI/input) are saved to ComfyUI/output.",
             search_aliases=ALIASES + ["mm preview", "mm save", "preview image mm", "save image mm", "compare"],
             inputs=[
                 io.Image.Input("images"),
@@ -465,7 +480,7 @@ class RoundtripPreviewSave(io.ComfyNode):
         return io.NodeOutput("\n".join(paths), ui=ui_out)
 
 
-NODE_LIST = [RoundtripLoadImage, RoundtripPreviewSave]
+NODE_LIST = [MMLoadImage, MMPreviewImage]
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +492,7 @@ def register_routes():
         from aiohttp import web
         from server import PromptServer
 
-        @PromptServer.instance.routes.post("/roundtrip/target")
+        @PromptServer.instance.routes.post("/mm-nodes/target")
         async def _target(request):
             data = await request.json()
             try:
@@ -497,7 +512,7 @@ def register_routes():
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 
-        @PromptServer.instance.routes.post("/roundtrip/save")
+        @PromptServer.instance.routes.post("/mm-nodes/save")
         async def _save(request):
             data = await request.json()
             try:
@@ -553,4 +568,4 @@ def register_routes():
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
     except Exception as e:  # noqa: BLE001 - without a server (unit tests) no route
-        print(f"[ImageRoundtrip] routes not registered: {e}")
+        print(f"[metamountain.MMNodes] routes not registered: {e}")
