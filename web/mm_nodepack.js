@@ -236,6 +236,19 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   btn2.tooltip = "choose folder and name";
   btn2.callback = async () => {
     const suggested = (node._rtTarget ? String(node._rtTarget).replace(/\\/g, "/").split("/").pop() : "") || `${stem}_edit.png`;
+    // the normal OS "save as" dialog (browser on the ComfyUI computer), starts in the target folder
+    const ln = findLoader(node)?.node;
+    const start = node._rtTarget || sourcePath || String(ln?.widgets?.find((x) => x.name === "path")?.value || "");
+    let d;
+    try {
+      d = await (await api.fetchApi("/mm-nodepack/dialog", { method: "POST", body: JSON.stringify({ mode: "save", path: start, name: suggested }) })).json();
+    } catch (e) { d = { ok: false, error: String(e) }; }
+    if (d.ok) {
+      if (d.path) await serverSave(d.path);
+      return;
+    }
+    if (d.local !== false) return toast("error", "Save as", d.error || "failed");
+    // browser on another computer: the browser's own save dialog
     if (typeof window.showSaveFilePicker === "function") {
       // real file dialog (Chrome/Edge, secure context: localhost or https)
       let handle;
@@ -370,7 +383,7 @@ app.registerExtension({
         const ob = node.addWidget("button", "📂 open…", null, async () => {
           let j;
           try {
-            j = await (await api.fetchApi("/mm-nodepack/open", { method: "POST", body: JSON.stringify({ path: pw.value || "" }) })).json();
+            j = await (await api.fetchApi("/mm-nodepack/dialog", { method: "POST", body: JSON.stringify({ mode: "open", path: pw.value || "" }) })).json();
           } catch (e) { j = { ok: false, error: String(e) }; }
           if (!j.ok) return toast("warn", "Open", j.error || "failed");
           if (!j.path) return;   // cancelled

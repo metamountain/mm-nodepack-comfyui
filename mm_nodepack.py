@@ -419,28 +419,46 @@ def is_local_request(remote: str) -> bool:
         return False
 
 
-def open_dialog(start_dir: str) -> str:
-    """OS file dialog (Windows: PowerShell, macOS: osascript, Linux: zenity/kdialog). '' = cancelled."""
+def file_dialog(mode: str, start_dir: str, name: str = "") -> str:
+    """The OS file dialog, mode 'open' or 'save' (Windows: PowerShell, macOS: osascript,
+    Linux: zenity/kdialog). Returns the chosen path, '' = cancelled."""
     import shutil
     import subprocess
     import sys
+    save = mode == "save"
+    env = dict(os.environ, MM_START=start_dir, MM_NAME=name)
     if os.name == "nt":
+        cls = "SaveFileDialog" if save else "OpenFileDialog"
+        # ComfyUI runs in the background: Windows refuses focus to background processes. An invisible
+        # topmost owner window + an ALT tap (foreground-lock workaround) brings the dialog to the front.
         ps = ("Add-Type -AssemblyName System.Windows.Forms;[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-              "$f=New-Object Windows.Forms.OpenFileDialog;$f.Filter='Images|*.png;*.jpg;*.jpeg;*.webp|All|*.*';"
-              "$f.InitialDirectory=$env:MM_START;$o=New-Object Windows.Forms.Form;$o.TopMost=$true;"
-              "if($f.ShowDialog($o) -eq 'OK'){$f.FileName}")
+              "Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class MMFg{"
+              "[DllImport(\"user32.dll\")]public static extern bool SetForegroundWindow(IntPtr h);"
+              "[DllImport(\"user32.dll\")]public static extern void keybd_event(byte k,byte s,uint f,UIntPtr e);}';"
+              "$o=New-Object Windows.Forms.Form;$o.TopMost=$true;$o.ShowInTaskbar=$false;$o.Opacity=0;"
+              "$o.StartPosition='CenterScreen';$o.Show();"
+              "[MMFg]::keybd_event(0x12,0,0,[UIntPtr]::Zero);[MMFg]::keybd_event(0x12,0,2,[UIntPtr]::Zero);"
+              "[void][MMFg]::SetForegroundWindow($o.Handle);$o.Activate();"
+              f"$f=New-Object Windows.Forms.{cls};$f.Filter='Images|*.png;*.jpg;*.jpeg;*.webp|All|*.*';"
+              "$f.InitialDirectory=$env:MM_START;$f.FileName=$env:MM_NAME;"
+              + ("$f.OverwritePrompt=$false;" if save else "")
+              + "if($f.ShowDialog($o) -eq 'OK'){'MMPATH:'+$f.FileName};$o.Close()")
         cmd = ["powershell", "-NoProfile", "-STA", "-Command", ps]
     elif sys.platform == "darwin":
-        cmd = ["osascript", "-e", 'POSIX path of (choose file of type {"public.image"} default location (POSIX file (system attribute "MM_START")))']
+        loc = 'default location (POSIX file (system attribute "MM_START"))'
+        cmd = ["osascript", "-e", f'POSIX path of (choose file name default name (system attribute "MM_NAME") {loc})' if save
+               else f'POSIX path of (choose file of type {{"public.image"}} {loc})']
     elif shutil.which("zenity"):
-        cmd = ["zenity", "--file-selection", f"--filename={start_dir}/"]
+        cmd = ["zenity", "--file-selection", f"--filename={os.path.join(start_dir, name)}"] + (["--save"] if save else [])
     elif shutil.which("kdialog"):
-        cmd = ["kdialog", "--getopenfilename", start_dir]
+        cmd = ["kdialog", "--getsavefilename" if save else "--getopenfilename", os.path.join(start_dir, name)]
     else:
-        raise RuntimeError("no file dialog available (install zenity or kdialog) – use upload or the path field")
+        raise RuntimeError("no file dialog available (install zenity or kdialog)")
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
-                       env=dict(os.environ, MM_START=start_dir), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                       env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+    if os.name == "nt":   # PowerShell may print other values; the path line is marked
+        lines = [x[7:] for x in lines if x.startswith("MMPATH:")]
     return lines[-1] if lines else ""
 
 
@@ -631,18 +649,21 @@ def register_routes():
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 
-        @PromptServer.instance.routes.post("/mm-nodepack/open")
-        async def _open(request):
-            # real path, no upload copy: the OS file dialog on the ComfyUI computer
+        @PromptServer.instance.routes.post("/mm-nodepack/dialog")
+        async def _dialog(request):
+            # the OS open/save dialog on the ComfyUI computer -> real paths, no browser sandbox
             if not is_local_request(request.remote):
-                return web.json_response({"ok": False, "error": "the file dialog opens on the ComfyUI computer – use upload or the path field"}, status=403)
+                return web.json_response({"ok": False, "local": False, "error": "the file dialog opens on the ComfyUI computer"}, status=403)
             try:
                 data = await request.json()
                 import folder_paths
+                mode = "save" if data.get("mode") == "save" else "open"
                 cur = _clean(str(data.get("path", "")))
-                start = os.path.dirname(cur) if cur and os.path.isfile(cur) else folder_paths.get_output_directory()
-                p = await asyncio.to_thread(open_dialog, start)
-                return web.json_response({"ok": True, "path": p, "view": view_entry(p) if p else None})
+                start = (cur if os.path.isdir(cur) else os.path.dirname(cur)) if cur else ""
+                if not start or not os.path.isdir(start):
+                    start = folder_paths.get_output_directory()
+                p = await asyncio.to_thread(file_dialog, mode, os.path.abspath(start), os.path.basename(str(data.get("name", ""))))
+                return web.json_response({"ok": True, "path": p, "view": view_entry(p) if p and mode == "open" else None})
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 
