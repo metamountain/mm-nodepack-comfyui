@@ -1,7 +1,7 @@
 """Unit tests for the pure helpers of mm_nodepack (no ComfyUI server needed).
 
 Run:
-  D:\\ComfyUI_windows_portable\\python_embeded\\python.exe D:\\Coding\\Comfyui\\mm-nodepack-comfyui\\tests\\test_mm_nodepack.py
+  <ComfyUI python> tests/test_mm_nodepack.py   (run from the pack folder inside ComfyUI/custom_nodes)
 """
 import os
 import sys
