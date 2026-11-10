@@ -732,6 +732,10 @@ def register_routes():
                 target = next_target(src, str(data.get("suffix", "_#")), str(data.get("save_as", "")), fmt)
                 if os.path.splitext(target)[1].lower() not in IMAGE_EXTS:
                     return web.json_response({"ok": False, "error": f"target extension not allowed: {os.path.splitext(target)[1]}"}, status=400)
+                out_dir = os.path.abspath(folder_paths.get_output_directory())
+                if not is_local_request(request.remote) and os.path.commonpath([out_dir, os.path.abspath(target)]) != out_dir:
+                    # browser on another computer (--listen): writes only inside the output folder
+                    return web.json_response({"ok": False, "error": "from another computer, saving is limited to the output folder"}, status=403)
                 with Image.open(src_file) as im:
                     # keep the preview's PNG text chunks (prompt/workflow) when saving as PNG
                     texts = {k: v for k, v in (im.info or {}).items() if isinstance(v, str)}

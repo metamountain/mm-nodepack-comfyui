@@ -1,6 +1,6 @@
 [project]
 name = "mm-nodepack-comfyui"
-description = "Load an image with its path, edit it, save it back next to the source (name_1, name_2 … or save as) – plus a preview node that saves single variants without a re-run."
+description = "Load an image with its real path (system file dialog), compare the result with the original, save it next to the source (name_1, name_2 …) or send it back to the loader and keep editing."
 version = "0.1.0"
 license = { file = "LICENSE" }
 dependencies = []
