@@ -197,14 +197,15 @@ export class ComparerWidget {
         const bx = (W - bw) / 2, by = r.bottom + 4;
         ctx.beginPath();
         ctx.roundRect ? ctx.roundRect(bx, by, bw, bh, 12) : ctx.rect(bx, by, bw, bh);
-        ctx.fillStyle = compare ? "rgba(70,120,190,.9)" : "rgba(60,60,60,.9)";
+        // black / white only: active = white button, off = black button
+        ctx.fillStyle = compare ? "#f2f2f2" : "#111";
         ctx.fill();
-        ctx.strokeStyle = compare ? "rgba(140,180,240,.9)" : "rgba(120,120,120,.8)";
+        ctx.strokeStyle = compare ? "#fff" : "#666";
         ctx.lineWidth = 1;
         ctx.stroke();
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillStyle = compare ? "#fff" : "rgba(190,190,190,.9)";
+        ctx.fillStyle = compare ? "#000" : "#bbb";
         ctx.fillText(label, W / 2, by + bh / 2 + 1);
         this.toggleBounds = { x: bx, y: by, w: bw, h: bh };
         ctx.font = "10px Arial";
