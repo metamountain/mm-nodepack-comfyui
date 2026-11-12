@@ -29,7 +29,7 @@ This pack gives you both with everything you need for editing images where they 
 
 ### Preview Image MM
 - Shows the result with a compare widget under the image: **compare slide** (move the mouse),
-  **compare hold** (press to see the original), **compare off**.
+  **compare hold** (press to see the original, the default), **compare off**.
 - **save** – next free `_#` name next to the source, never overwrites.
 - **save as…** – your system "save as" dialog, starting in the source folder.
 - **send to loader** – saves as `_#` and puts it into the Load Image MM, so the next run edits the new image.

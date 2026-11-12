@@ -12,7 +12,7 @@ const MODE_LABEL = { slide: "compare slide", hold: "compare hold", off: "compare
 export function compareMode(node) {
   const m = node.properties?.mm_compare;
   if (m === false) return "off";
-  return MODES.includes(m) ? m : "slide";
+  return MODES.includes(m) ? m : "hold";
 }
 
 const LABEL = "rgba(170,170,170,.85)", LABEL_HI = "rgba(225,225,225,1)", DIM = "rgba(150,150,150,.6)";
