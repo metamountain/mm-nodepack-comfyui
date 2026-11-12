@@ -5,9 +5,9 @@ This pack gives you both with everything you need for editing images where they 
 
 - **Real paths.** Type or paste a full path, or pick a file: when the picked image is one of your ComfyUI outputs, the loader finds the original and keeps its real path.
 - **Handy outputs.** `image`, `mask`, `width`, `height`, `path`, so you don't need a Get Image Size node. One `sync` link carries original, path, mask, size and format to the preview.
-- **Compare built in.** Original vs. result under the image: slide, hold or off. No extra comparer node.
+- **Compare built in.** Original vs. result under the image: hold (default), slide or off. No extra comparer node.
 - **Save next to the source.** `house.png` → `house_1.png`, `house_2.png`, …, never overwrites.
-  **save as…** opens the system dialog in the source folder.
+  **save as…** opens the system dialog in the folder the next save goes to.
 - **Iterate.** **send to loader** (or **auto send**) puts the result back into the loader, so the next run edits the new image.
 - **One node instead of three.** Preview Image MM replaces Preview Image + Save Image + an image comparer.
 
@@ -28,11 +28,13 @@ This pack gives you both with everything you need for editing images where they 
 
 ### Preview Image MM
 - Shows the result with a compare widget under the image: **compare hold** (press to see the original,
-  the default), **compare slide** (move the mouse), **compare off**.
+  the default), **compare slide** (move the mouse), **compare off**. The button cycles the modes;
+  the choice is not saved, every load starts with **compare hold**.
 - **send to loader** – saves as `_#` and puts it into the Load Image MM, so the next run edits the new image.
 - **open folder** – the browser's file picker, same as **choose file** in Load Image MM.
 - **save** – next free `_#` name next to the source, never overwrites.
-- **save as…** – your system "save as" dialog, starting in the source folder.
+- **save as…** – your system "save as" dialog, starting in the folder the next save goes to, name filled in;
+  only in a browser on the ComfyUI computer (elsewhere the browser's own save dialog).
 - `auto_save` on: every run saves all images. `suffix` (default `_#`, `#` = next free number),
   `save_as` (name or full path), `format` (same as source / png / jpg / webp), `quality`, `embed_workflow`.
 - `auto_send` on: after every run the result goes to the Load Image MM like **send to loader**
