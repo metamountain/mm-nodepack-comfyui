@@ -6,7 +6,7 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-const MODES = ["slide", "hold", "off"];
+const MODES = ["hold", "slide", "off"];   // hold = default, first in the cycle
 const MODE_LABEL = { slide: "compare slide", hold: "compare hold", off: "compare off" };
 
 export function compareMode(node) {
@@ -118,7 +118,7 @@ export class ComparerWidget {
 
   // space under the image: compare button (only with an original) + size line
   _reserve() {
-    return this.imgA?.naturalWidth ? 44 : 14;
+    return this.imgA?.naturalWidth ? 40 : 14;
   }
 
   selectVariant(i) {
@@ -135,6 +135,7 @@ export class ComparerWidget {
     this._bottom = this.computedHeight ? y + this.computedHeight - 4 : undefined;
     const b = this.value.b;
     const W = node.size[0];
+    const font = ctx.font;   // the canvas' widget font, for the CI toggle button
     ctx.save();
     ctx.textBaseline = "top";
     ctx.font = "10px Arial";
@@ -190,23 +191,20 @@ export class ComparerWidget {
       ctx.font = "10px Arial";
       ctx.textBaseline = "top";
       if (haveA) {
-        // big centered toggle button directly under the image, sizes below it
-        const label = MODE_LABEL[mode];
-        ctx.font = "bold 13px Arial";
-        const bw = Math.min(W - 16, Math.max(150, ctx.measureText(label).width + 32)), bh = 24;
-        const bx = (W - bw) / 2, by = r.bottom + 4;
-        ctx.beginPath();
-        ctx.roundRect ? ctx.roundRect(bx, by, bw, bh, 12) : ctx.rect(bx, by, bw, bh);
-        // black / white only: active = white button, off = black button
-        ctx.fillStyle = compare ? "#f2f2f2" : "#111";
-        ctx.fill();
-        ctx.strokeStyle = compare ? "#fff" : "#666";
+        // toggle under the image, drawn exactly like ComfyUI's own button widget
+        // (frontend ButtonWidget: margin 15, widget height, theme colors, label at 0.7 height)
+        const LG = window.LiteGraph || {};
+        const bh = LG.NODE_WIDGET_HEIGHT || 20, bx = 15, bw = W - 30, by = r.bottom + 4;
+        ctx.font = font;
+        ctx.fillStyle = LG.WIDGET_BGCOLOR || "#222";
+        ctx.fillRect(bx, by, bw, bh);
+        ctx.strokeStyle = LG.WIDGET_OUTLINE_COLOR || "#666";
         ctx.lineWidth = 1;
-        ctx.stroke();
+        ctx.strokeRect(bx, by, bw, bh);
         ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillStyle = compare ? "#000" : "#bbb";
-        ctx.fillText(label, W / 2, by + bh / 2 + 1);
+        ctx.textBaseline = "alphabetic";
+        ctx.fillStyle = LG.WIDGET_TEXT_COLOR || "#DDD";
+        ctx.fillText(MODE_LABEL[mode], W / 2, by + bh * 0.7);
         this.toggleBounds = { x: bx, y: by, w: bw, h: bh };
         ctx.font = "10px Arial";
         ctx.textBaseline = "top";

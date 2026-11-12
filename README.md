@@ -27,8 +27,8 @@ This pack gives you both with everything you need for editing images where they 
   `width`, `height`, `path`.
 
 ### Preview Image MM
-- Shows the result with a compare widget under the image: **compare slide** (move the mouse),
-  **compare hold** (press to see the original, the default), **compare off**.
+- Shows the result with a compare widget under the image: **compare hold** (press to see the original,
+  the default), **compare slide** (move the mouse), **compare off**.
 - **send to loader** – saves as `_#` and puts it into the Load Image MM, so the next run edits the new image.
 - **open folder** – the browser's file picker, same as **choose file** in Load Image MM.
 - **save** – next free `_#` name next to the source, never overwrites.
