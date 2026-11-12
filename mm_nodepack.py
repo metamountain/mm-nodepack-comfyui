@@ -737,6 +737,10 @@ class MMPreviewImage(io.ComfyNode):
                 io.Combo.Input("format", options=FORMATS, default="same as source"),
                 io.Int.Input("quality", default=95, min=1, max=100, tooltip="jpg/webp quality"),
                 io.Boolean.Input("embed_workflow", default=True, tooltip="embed prompt + workflow into the PNG (png only)"),
+                # last on purpose: widgets_values of saved workflows are positional
+                io.Boolean.Input("auto_send", default=False, label_on="auto send", label_off="no autosend",
+                                 tooltip="on: after every run the result is saved as _# and put into the Load Image MM, "
+                                         "so the next run edits it (with auto save on, the auto-saved file is used)"),
             ],
             outputs=[
                 io.String.Output("saved_paths", display_name="saved", tooltip="one path per line (auto save)"),
@@ -746,7 +750,8 @@ class MMPreviewImage(io.ComfyNode):
 
     @classmethod
     def execute(cls, images, sync=None, auto_save=False, source="auto", suffix="_#", save_as="",
-                format="same as source", quality=95, embed_workflow=True):
+                format="same as source", quality=95, embed_workflow=True, auto_send=False):
+        # auto_send is done by the browser after the run (same path as the "send to loader" button)
         if images is None or len(images) == 0:
             raise ValueError("no images to preview")
         note, src_id = "", ""

@@ -213,6 +213,30 @@ async function previewBlob(entry, name, quality) {
   return await new Promise((res) => c.toBlob(res, mime, Math.max(0.01, Math.min(1, quality / 100))));
 }
 
+// A button whose job an auto switch already does is dimmed and not clickable
+// (disabled: the frontend skips it on click and drops its outline).
+function dim(b, off) {
+  if (!b) return;
+  b.disabled = off;
+  if (b._mmDim || typeof b.drawWidget !== "function") return;
+  const draw = b.drawWidget.bind(b);
+  b.drawWidget = function (ctx, opts) {
+    if (!this.disabled) return draw(ctx, opts);
+    const a = ctx.globalAlpha;
+    ctx.globalAlpha = a * 0.35;
+    try { return draw(ctx, opts); } finally { ctx.globalAlpha = a; }
+  };
+  b._mmDim = true;
+}
+
+function applyAutoState(node) {
+  const on = (name) => node.widgets?.find((x) => x.name === name)?.value === true;
+  const [save, , send] = node._rtButtons || [];
+  dim(save, on("auto_save"));
+  dim(send, on("auto_send"));
+  node.setDirtyCanvas?.(true, true);
+}
+
 function addSaveButtons(node, entry, sourcePath, variant) {
   node._rtRemoveButtons?.();
   const mk = (label) => {
@@ -307,10 +331,11 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   };
   const btn3 = mk("↩ send to loader");
   btn3.tooltip = "save as _# and load it in the Load Image MM (next run works on this creation)";
-  btn3.callback = async () => {
+  // savedPath: auto_save already wrote this creation -> send that file instead of saving a second copy
+  const sendToLoader = async (savedPath) => {
     const loader = await resolveLoader(node);
     if (!loader) return;
-    const j = await serverSave("", loader);
+    const j = savedPath ? { ok: true, path: savedPath } : await serverSave("", loader);
     if (!j?.ok) return;
     const pw = loader.widgets?.find((w) => w.name === "path");
     if (!pw) return;
@@ -327,7 +352,10 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     loader.setDirtyCanvas?.(true, true);
     toast("info", `Loader #${loader.id}`, j.path);
   };
+  btn3.callback = () => sendToLoader();
+  node._rtSendToLoader = sendToLoader;
   node._rtButtons = [btn1, btn2, btn3];
+  applyAutoState(node);
   node._rtRemoveButtons = () => {
     for (const b of node._rtButtons || []) node.widgets?.splice(node.widgets.indexOf(b), 1);
     node._rtButtons = null;
@@ -361,6 +389,9 @@ app.registerExtension({
       // buttons for the selected creation (save _# / save as…)
       const sel = cmp?.selected ?? 0;
       if (b[sel]) addSaveButtons(this, b[sel], source, sel);
+      if (b[sel] && this.widgets?.find((w) => w.name === "auto_send")?.value === true) {
+        this._rtSendToLoader?.(saved[sel] || "");
+      }
       this._rtRefreshButtons = () => {
         const c = this.widgets?.find((w) => w.name === "comparer");
         if (c && b[c.selected]) addSaveButtons(this, b[c.selected], source, c.selected);
@@ -482,6 +513,16 @@ app.registerExtension({
         cb?.(...a);
         if (name === "source") node._rtNote = "";  // the run's note is outdated now
         node._rtRefreshTarget?.();
+      };
+    }
+    for (const name of ["auto_save", "auto_send"]) {
+      const w = node.widgets?.find((x) => x.name === name);
+      if (!w) continue;
+      const cb = w.callback;
+      w.callback = (...a) => {
+        const r = cb?.(...a);
+        applyAutoState(node);
+        return r;
       };
     }
     node._rtRefreshTarget?.();

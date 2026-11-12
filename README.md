@@ -35,6 +35,9 @@ This pack gives you both with everything you need for editing images where they 
 - **send to loader** – saves as `_#` and puts it into the Load Image MM, so the next run edits the new image.
 - `auto_save` on: every run saves all images. `suffix` (default `_#`, `#` = next free number),
   `save_as` (name or full path), `format` (same as source / png / jpg / webp), `quality`, `embed_workflow`.
+- `auto_send` on: after every run the result goes to the Load Image MM like **send to loader**
+  (with `auto_save` on, the auto-saved file is used – no second copy).
+- A button an auto switch already covers is greyed out: **save** with `auto_save`, **send to loader** with `auto_send`.
 - Without a `sync` link, `source = auto` uses the Load Image MM upstream.
 
 ## Install
