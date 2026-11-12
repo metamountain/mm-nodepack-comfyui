@@ -29,7 +29,7 @@ This pack gives you both with everything you need for editing images where they 
 ### Preview Image MM
 - Shows the result with a compare widget under the image: **compare hold** (press to see the original,
   the default), **compare slide** (move the mouse), **compare off**. The button cycles the modes;
-  the choice is not saved, every load starts with **compare hold**.
+  the choice is saved with the workflow, new nodes start with **compare hold**.
 - **send to loader** – saves as `_#` and puts it into the Load Image MM, so the next run edits the new image.
 - **open folder** – the browser's file picker, same as **choose file** in Load Image MM.
 - **save** – next free `_#` name next to the source, never overwrites.

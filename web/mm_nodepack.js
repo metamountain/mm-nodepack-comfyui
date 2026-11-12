@@ -20,7 +20,7 @@ function loadImage(entry) {
 // compare slider module, loaded once on first use
 let comparerModule = null;
 // ?v= : bump on every comparer change, else the browser keeps the old module from its cache
-const loadComparer = () => (comparerModule ??= import("./lib/comparer.mjs?v=3"));
+const loadComparer = () => (comparerModule ??= import("./lib/comparer.mjs?v=4"));
 
 function debounce(fn, ms) {
   let t = null;
