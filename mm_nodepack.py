@@ -747,6 +747,9 @@ class MMPreviewImage(io.ComfyNode):
                              tooltip="from Load Image MM: original for the compare, target folder, name and format"),
                 io.Boolean.Input("auto_save", default=False, label_on="auto save", label_off="no autosave",
                                  tooltip="on: every run saves all creations; off: preview only, save with the buttons"),
+                io.Boolean.Input("auto_send", default=False, label_on="auto send", label_off="no autosend",
+                                 tooltip="on: after every run the result is saved as _# and put into the Load Image MM, "
+                                         "so the next run edits it (with auto save on, the auto-saved file is used)"),
                 io.String.Input("source", default="auto",
                                 tooltip="without a sync link: 'auto' = the Load Image MM upstream (or the only one); "
                                         "with several loaders type its number, e.g. #12"),
@@ -757,10 +760,6 @@ class MMPreviewImage(io.ComfyNode):
                 io.Combo.Input("format", options=FORMATS, default="same as source"),
                 io.Int.Input("quality", default=95, min=1, max=100, tooltip="jpg/webp quality"),
                 io.Boolean.Input("embed_workflow", default=True, tooltip="embed prompt + workflow into the PNG (png only)"),
-                # last on purpose: widgets_values of saved workflows are positional
-                io.Boolean.Input("auto_send", default=False, label_on="auto send", label_off="no autosend",
-                                 tooltip="on: after every run the result is saved as _# and put into the Load Image MM, "
-                                         "so the next run edits it (with auto save on, the auto-saved file is used)"),
             ],
             outputs=[
                 io.String.Output("saved_paths", display_name="saved", tooltip="one path per line (auto save)"),
