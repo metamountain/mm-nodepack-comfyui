@@ -431,30 +431,14 @@ def dialog_available() -> bool:
 
 
 def file_dialog(mode: str, start_dir: str, name: str = "") -> str:
-    """The OS file dialog, mode 'open' or 'save' (Windows: PowerShell, macOS: osascript,
-    Linux: zenity/kdialog). Returns the chosen path, '' = cancelled."""
+    """The OS file dialog, mode 'open' or 'save'. Returns the chosen path, '' = cancelled."""
     import shutil
     import subprocess
     import sys
     save = mode == "save"
     env = dict(os.environ, MM_START=start_dir, MM_NAME=name)
     if os.name == "nt":
-        cls = "SaveFileDialog" if save else "OpenFileDialog"
-        # ComfyUI runs in the background: Windows refuses focus to background processes. An invisible
-        # topmost owner window + an ALT tap (foreground-lock workaround) brings the dialog to the front.
-        ps = ("Add-Type -AssemblyName System.Windows.Forms;[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-              "Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class MMFg{"
-              "[DllImport(\"user32.dll\")]public static extern bool SetForegroundWindow(IntPtr h);"
-              "[DllImport(\"user32.dll\")]public static extern void keybd_event(byte k,byte s,uint f,UIntPtr e);}';"
-              "$o=New-Object Windows.Forms.Form;$o.TopMost=$true;$o.ShowInTaskbar=$false;$o.Opacity=0;"
-              "$o.StartPosition='CenterScreen';$o.Show();"
-              "[MMFg]::keybd_event(0x12,0,0,[UIntPtr]::Zero);[MMFg]::keybd_event(0x12,0,2,[UIntPtr]::Zero);"
-              "[void][MMFg]::SetForegroundWindow($o.Handle);$o.Activate();"
-              f"$f=New-Object Windows.Forms.{cls};$f.Filter='Images|*.png;*.jpg;*.jpeg;*.webp|All|*.*';"
-              "$f.InitialDirectory=$env:MM_START;$f.FileName=$env:MM_NAME;"
-              + ("$f.OverwritePrompt=$false;" if save else "")
-              + "if($f.ShowDialog($o) -eq 'OK'){'MMPATH:'+$f.FileName};$o.Close()")
-        cmd = ["powershell", "-NoProfile", "-STA", "-Command", ps]
+        return _win_file_dialog_tk(start_dir, name, save)
     elif sys.platform == "darwin":
         loc = 'default location (POSIX file (system attribute "MM_START"))'
         cmd = ["osascript", "-e", f'POSIX path of (choose file name default name (system attribute "MM_NAME") {loc})' if save
@@ -468,9 +452,117 @@ def file_dialog(mode: str, start_dir: str, name: str = "") -> str:
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
                        env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     lines = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
-    if os.name == "nt":   # PowerShell may print other values; the path line is marked
+    if os.name == "nt":
         lines = [x[7:] for x in lines if x.startswith("MMPATH:")]
     return lines[-1] if lines else ""
+
+
+def _win_file_dialog_tk(start_dir: str, name: str, save: bool) -> str:
+    """Windows file dialog via tkinter — instant, no subprocess, topmost focus."""
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    root.lift()
+    root.focus_force()
+    ft = [("Images", "*.png *.jpg *.jpeg *.webp"), ("All", "*.*")]
+    if save:
+        p = filedialog.asksaveasfilename(
+            parent=root, title="Save Image", initialdir=start_dir,
+            initialfile=name, filetypes=ft, defaultextension=".png")
+    else:
+        p = filedialog.askopenfilename(
+            parent=root, title="Choose Image", initialdir=start_dir,
+            initialfile=name, filetypes=ft)
+    root.destroy()
+    return p
+
+
+def _win_file_dialog(start_dir: str, name: str, save: bool) -> str:
+    """Native Windows file dialog via ctypes — no PowerShell, appears in <100 ms."""
+    import ctypes
+    from ctypes import wintypes
+
+    comdlg32 = ctypes.windll.comdlg32
+    user32 = ctypes.windll.user32
+
+    # Minimize the foreground window so the dialog is guaranteed visible.
+    # Restore it after the user picks a file.
+    user32.keybd_event(0x12, 0, 0, 0)   # ALT down
+    user32.keybd_event(0x12, 0, 2, 0)   # ALT up
+    user32.AllowSetForegroundWindow(-1)
+    hwnd = user32.GetForegroundWindow()
+    if hwnd:
+        user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+        import time; time.sleep(0.15)
+
+    # Filter: images + all
+    filter_str = "Images\0*.png;*.jpg;*.jpeg;*.webp\0All Files\0*.*\0\0"
+
+    # File buffer (long path support)
+    buf = ctypes.create_unicode_buffer(32768)
+    buf.value = name or ""
+
+    class OPENFILENAMEW(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wintypes.DWORD),
+            ("hwndOwner", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE),
+            ("lpstrFilter", wintypes.LPCWSTR),
+            ("lpstrCustomFilter", wintypes.LPWSTR),
+            ("nMaxCustFilter", wintypes.DWORD),
+            ("nFilterIndex", wintypes.DWORD),
+            ("lpstrFile", wintypes.LPWSTR),
+            ("nMaxFile", wintypes.DWORD),
+            ("lpstrFileTitle", wintypes.LPWSTR),
+            ("nMaxFileTitle", wintypes.DWORD),
+            ("lpstrInitialDir", wintypes.LPCWSTR),
+            ("lpstrTitle", wintypes.LPCWSTR),
+            ("Flags", wintypes.DWORD),
+            ("nFileOffset", wintypes.WORD),
+            ("nFileExtension", wintypes.WORD),
+            ("lpstrDefExt", wintypes.LPCWSTR),
+            ("lCustData", ctypes.c_long),
+            ("lpfnHook", ctypes.c_void_p),
+            ("lpTemplateName", wintypes.LPCWSTR),
+            ("pvReserved", ctypes.c_void_p),
+            ("dwReserved", wintypes.DWORD),
+            ("FlagsEx", wintypes.DWORD),
+        ]
+
+    OFN_FLAGS = 0x00080000  # OFN_EXPLORER
+    if save:
+        OFN_FLAGS |= 0x00000002  # OFN_OVERWRITEPROMPT
+        OFN_FLAGS |= 0x00001000  # OFN_PATHMUSTEXIST
+        OFN_FLAGS |= 0x00002000  # OFN_FILEMUSTEXIST (not for save, but harmless)
+        OFN_FLAGS &= ~0x00002000  # remove FILEMUSTEXIST for save
+    else:
+        OFN_FLAGS |= 0x00001000  # OFN_PATHMUSTEXIST
+        OFN_FLAGS |= 0x00002000  # OFN_FILEMUSTEXIST
+
+    ofn = OPENFILENAMEW()
+    ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+    ofn.hwndOwner = hwnd
+    ofn.lpstrFilter = filter_str
+    ofn.nFilterIndex = 1
+    ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
+    ofn.nMaxFile = len(buf)
+    ofn.lpstrInitialDir = start_dir or None
+    ofn.lpstrTitle = "Save Image" if save else "Choose Image"
+    ofn.Flags = OFN_FLAGS
+    if save:
+        ofn.lpstrDefExt = "png"
+
+    if save:
+        ok = comdlg32.GetSaveFileNameW(ctypes.byref(ofn))
+    else:
+        ok = comdlg32.GetOpenFileNameW(ctypes.byref(ofn))
+    # Restore the minimized window
+    if hwnd:
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+    return buf.value if ok else ""
 
 
 def view_entry(p: str):
@@ -575,7 +667,7 @@ class MMPreviewImage(io.ComfyNode):
                 io.Image.Input("images"),
                 SOURCE.Input("sync", optional=True,
                              tooltip="from Load Image MM: original for the compare, target folder, name and format"),
-                io.Boolean.Input("auto_save", default=False, label_on="auto save", label_off="save per button",
+                io.Boolean.Input("auto_save", default=False, label_on="auto save", label_off="no autosave",
                                  tooltip="on: every run saves all creations; off: preview only, save with the buttons"),
                 io.String.Input("source", default="auto",
                                 tooltip="without a sync link: 'auto' = the Load Image MM upstream (or the only one); "
@@ -694,6 +786,20 @@ def register_routes():
                     return web.json_response({"ok": True, "path": o[0] if len(o) == 1 else "", "file": p,
                                               "candidates": o if len(o) > 1 else []})
                 return web.json_response({"ok": True, "path": p, "file": p})
+            except Exception as e:  # noqa: BLE001
+                return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+        @PromptServer.instance.routes.post("/mm-nodepack/preview")
+        async def _preview(request):
+            # live preview of the loader's current file (compare-hold without re-run).
+            # same resolution as the backend: path wins, else the upload combo.
+            data = await request.json()
+            try:
+                p = resolve_source(str(data.get("image", "")), str(data.get("path", "")))
+                entry = view_entry(p)
+                if entry is None:
+                    return web.json_response({"ok": False, "error": "file not in output/input folder"}, status=404)
+                return web.json_response({"ok": True, "view": entry, "path": p})
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 

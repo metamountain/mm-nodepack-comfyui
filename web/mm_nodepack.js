@@ -75,6 +75,35 @@ function loaderLabel(n) {
   return `#${n.id}  ${f}`;
 }
 
+// When the loader's file changes (picker, upload, path typing, choose-file),
+// refresh the compare slider's "original" (imgA) on every preview node that
+// resolves to this loader — so compare-hold always shows the current source.
+const _refreshCmp = debounce(async (loaderNode) => {
+  const g = loaderNode.graph || app.graph;
+  const pw = loaderNode.widgets?.find((w) => w.name === "path");
+  const iw = loaderNode.widgets?.find((w) => w.name === "image");
+  const path = String(pw?.value || "").trim();
+  const image = String(iw?.value || "").trim();
+  if (!path && !image) return;
+  let j;
+  try {
+    j = await (await api.fetchApi("/mm-nodepack/preview", { method: "POST", body: JSON.stringify({ path, image }) })).json();
+  } catch { return; }
+  if (!j?.ok || !j.view) return;
+  const aEntry = j.view;
+  for (const n of g._nodes || []) {
+    if (n.comfyClass !== "MMPreviewImage") continue;
+    const { node: src } = findLoader(n);
+    if (src !== loaderNode) continue;
+    const cmp = n.widgets?.find((w) => w.name === "comparer");
+    if (!cmp) continue;
+    cmp.value.a = [aEntry];
+    cmp.imgA = loadImage(aEntry);
+    cmp.imgA.onload = () => n.setDirtyCanvas?.(true, true);
+    n.setDirtyCanvas?.(true, true);
+  }
+}, 400);
+
 // last pointer position (the button callback has no DOM event to anchor the menu)
 const lastPtr = { clientX: 200, clientY: 200 };
 window.addEventListener("pointerdown", (e) => { lastPtr.clientX = e.clientX; lastPtr.clientY = e.clientY; }, true);
@@ -367,6 +396,7 @@ app.registerExtension({
                   pw.value = p;
                   node.graph?.change?.();
                   node.setDirtyCanvas?.(true, true);
+                  _refreshCmp(node);
                 };
                 setPath(j.path);
                 // identical copies in several folders: the browser never tells which one -> say so
@@ -379,30 +409,15 @@ app.registerExtension({
         // picker + upload stay clickable even with a path set: choosing/uploading clears the path
         // (the upload widget calls iw.callback too), so the path never has to be deleted by hand
         const sync = () => node.setDirtyCanvas?.(true, true);
-        // "choose file": the OS file dialog (browser on the ComfyUI computer) -> the real path at once,
-        // no upload copy. Browser on another computer: the normal upload, as before.
+        // "choose file": keep the standard browser file picker (instant), just add comparer refresh.
         const upw = node.widgets?.find((w) => w.name === "upload" || w.type === "button");
         if (upw) {
-          const upload = upw.callback;
+          const origUpload = upw.callback;
           upw.label = "choose file";
           upw.callback = async function (...args) {
-            let j;
-            document.body.style.cursor = "progress";   // the system dialog needs a moment to appear
-            try {
-              j = await (await api.fetchApi("/mm-nodepack/dialog", { method: "POST", body: JSON.stringify({ mode: "open", path: pw.value || "" }) })).json();
-            } catch (e) { j = { ok: false, error: String(e) }; }
-            document.body.style.cursor = "";
-            if (!j.ok) return j.local === false ? upload?.apply(this, args) : toast("error", "Choose file", j.error || "failed");
-            if (!j.path) return;   // cancelled
-            pw.value = j.path;
-            node._rtPathShown = "";
-            node.imgs = undefined;
-            if (j.view) {
-              const img = loadImage(j.view);
-              img.onload = () => { node._rtPathShown = j.path; node.imgs = [img]; node.imageIndex = 0; app.graph.setDirtyCanvas(true, true); };
-            }
-            node.graph?.change?.();
-            node.setDirtyCanvas?.(true, true);
+            const r = await origUpload?.apply(this, args);
+            _refreshCmp(node);
+            return r;
           };
         }
         // the thumbnail belongs to the picker; with a path it would show the wrong image
@@ -418,6 +433,7 @@ app.registerExtension({
           const r = pcb?.apply(this, arguments);
           sync();
           clearThumb();
+          _refreshCmp(node);
           return r;
         };
         const origCfg = node.onConfigure;
