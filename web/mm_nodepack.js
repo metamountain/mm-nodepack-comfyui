@@ -433,6 +433,10 @@ app.registerExtension({
       if (iw && pw) {
         const cb = iw.callback;
         iw.callback = function (v) {
+          // the pick is the source now: clear the old path BEFORE the core loads the thumbnail,
+          // else onDrawBackground drops it as "belongs to another path" (resolve sets the new one)
+          pw.value = "";
+          node._rtPathShown = "";
           const r = cb?.apply(this, arguments);
           const name = String(v ?? iw.value ?? "");
           if (name) {
