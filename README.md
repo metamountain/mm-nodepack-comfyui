@@ -53,6 +53,20 @@ No extra Python packages.
 - Images pasted with Ctrl+V have no home folder: **save** then asks where to save.
 - Opened from another computer (`--listen`), saving is limited to the ComfyUI output folder.
 
+## Status: Testing Phase
+
+> ⚠️ **This pack is still in the testing/debugging phase.**
+> Things may break, behave unexpectedly, or change without notice.
+> **Bug reports are very welcome** — please open an issue on GitHub with:
+> - OS (Windows / macOS / Linux) + ComfyUI version
+> - What you did (steps to reproduce)
+> - What happened vs. what you expected
+> - Screenshot if possible
+>
+> Comments and feedback on any issue are appreciated.
+
+## License
+
 ## License
 
 MIT

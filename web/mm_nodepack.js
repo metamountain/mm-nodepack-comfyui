@@ -409,25 +409,15 @@ app.registerExtension({
         // picker + upload stay clickable even with a path set: choosing/uploading clears the path
         // (the upload widget calls iw.callback too), so the path never has to be deleted by hand
         const sync = () => node.setDirtyCanvas?.(true, true);
-        // "choose file": backend tkinter dialog (instant, any folder) → sets path widget.
+        // "choose file": browser file picker → upload to input/ → set image widget + refresh comparer.
         const upw = node.widgets?.find((w) => w.name === "upload" || w.type === "button");
         if (upw) {
+          const origUpload = upw.callback;
           upw.label = "choose file";
           upw.callback = async function (...args) {
-            try {
-              const r = await fetch("/mm-nodepack/dialog", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ mode: "open", start: pw.value || "", name: "" })
-              });
-              const j = await r.json();
-              if (j.path) {
-                pw.value = j.path;
-                node.setDirtyCanvas?.(true, true);
-                _refreshCmp(node);
-              }
-            } catch (e) { console.warn("[MM] dialog failed", e); }
-            return null;
+            const r = await origUpload?.apply(this, args);
+            _refreshCmp(node);
+            return r;
           };
         }
         // the thumbnail belongs to the picker; with a path it would show the wrong image
