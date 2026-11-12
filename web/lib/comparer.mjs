@@ -1,7 +1,7 @@
 // Compare slider for Preview Image MM - loaded on demand (dynamic import) by mm_nodepack.js
 // the first time a Preview Image MM node is created. Slider logic adapted from
 // rgthree-comfy image_comparer.js (MIT). .mjs so ComfyUI does not load it as an extension.
-// Modes (button under the image, node property mm_compare): slide (rgthree "Slide"),
+// Modes (button under the image, node._mmCompare, not saved): slide (rgthree "Slide"),
 // hold (rgthree "Click": original while the mouse button is held), off.
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
@@ -10,8 +10,8 @@ const MODES = ["hold", "slide", "off"];   // hold = default, first in the cycle
 const MODE_LABEL = { slide: "compare slide", hold: "compare hold", off: "compare off" };
 
 export function compareMode(node) {
-  const m = node.properties?.mm_compare;
-  if (m === false) return "off";
+  // old workflows may still carry properties.mm_compare: ignored, hold is the standard
+  const m = node._mmCompare;
   return MODES.includes(m) ? m : "hold";
 }
 
@@ -69,8 +69,8 @@ export class ComparerWidget {
     }
     const tb = this.toggleBounds;
     if (tb && pos[0] >= tb.x && pos[0] <= tb.x + tb.w && pos[1] >= tb.y && pos[1] <= tb.y + tb.h) {
-      const p = (this.node.properties ??= {});
-      p.mm_compare = MODES[(MODES.indexOf(compareMode(this.node)) + 1) % MODES.length];   // display only
+      // display only, not saved in the workflow: every load starts with compare hold
+      this.node._mmCompare = MODES[(MODES.indexOf(compareMode(this.node)) + 1) % MODES.length];
       this.node.setDirtyCanvas?.(true, true);
       return true;
     }
