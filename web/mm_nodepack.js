@@ -267,6 +267,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
       j = { ok: false, error: String(e) };
     }
     if (j.ok) {
+      node._rtLastSaved = j.path;
       toast("success", "Saved", j.path);
       node._rtRefreshTarget?.(); // next number is now taken
     } else toast("error", "Save failed", j.error || "unknown error");
@@ -354,7 +355,19 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   };
   btn3.callback = () => sendToLoader();
   node._rtSendToLoader = sendToLoader;
-  node._rtButtons = [btn1, btn2, btn3];
+  const btn4 = mk("📂 open folder");
+  btn4.tooltip = "show the last saved file in its folder (else the folder the next save goes to)";
+  btn4.callback = async () => {
+    const path = node._rtLastSaved || node._rtTarget || sourcePath;
+    if (!path) return toast("warn", "Open folder", "nothing saved yet and no target folder");
+    try {
+      const j = await (await api.fetchApi("/mm-nodepack/open-folder", { method: "POST", body: JSON.stringify({ path }) })).json();
+      if (!j.ok) toast("error", "Open folder", j.error || "failed");
+    } catch (e) {
+      toast("error", "Open folder", String(e));
+    }
+  };
+  node._rtButtons = [btn1, btn2, btn3, btn4];
   applyAutoState(node);
   node._rtRemoveButtons = () => {
     for (const b of node._rtButtons || []) node.widgets?.splice(node.widgets.indexOf(b), 1);
@@ -385,6 +398,7 @@ app.registerExtension({
       if (cmp) cmp.setData(a, b);
       else this._rtPending = [a, b];   // comparer module still loading
       const saved = Array.isArray(message?.saved) ? message.saved : [];
+      if (saved.length) this._rtLastSaved = saved[saved.length - 1];
       if (saved.length) toast("success", "Auto-saved", saved.length > 1 ? `${saved[saved.length - 1]} (+${saved.length - 1})` : saved[0]);
       // buttons for the selected creation (save _# / save as…)
       const sel = cmp?.selected ?? 0;

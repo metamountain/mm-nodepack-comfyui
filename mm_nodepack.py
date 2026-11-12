@@ -419,6 +419,26 @@ def is_local_request(remote: str) -> bool:
         return False
 
 
+def open_folder(p: str) -> str:
+    """Show p in the OS file manager: a file is selected in its folder, a folder is opened.
+    Returns the folder that was opened."""
+    import subprocess
+    import sys
+    p = os.path.abspath(_clean(p))
+    is_file = os.path.isfile(p)
+    folder = os.path.dirname(p) if is_file or not os.path.isdir(p) else p
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"folder not found: {folder}")
+    if os.name == "nt":
+        if is_file:
+            subprocess.Popen(["explorer", "/select,", p])
+        else:
+            os.startfile(folder)  # noqa: S606
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", folder])
+    return folder
+
+
 def dialog_available() -> bool:
     """An OS file dialog can open here (Linux: a desktop session and zenity/kdialog; a headless
     server or container has none -> the browser upload / save picker is used instead)."""
@@ -830,6 +850,17 @@ def register_routes():
                     start = folder_paths.get_output_directory()
                 p = await asyncio.to_thread(file_dialog, mode, os.path.abspath(start), os.path.basename(str(data.get("name", ""))))
                 return web.json_response({"ok": True, "path": p, "view": view_entry(p) if p and mode == "open" else None})
+            except Exception as e:  # noqa: BLE001
+                return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+        @PromptServer.instance.routes.post("/mm-nodepack/open-folder")
+        async def _open_folder(request):
+            # the file manager opens on the ComfyUI computer -> only for a browser on that computer
+            if not is_local_request(request.remote):
+                return web.json_response({"ok": False, "error": "open folder only works in a browser on the ComfyUI computer"}, status=403)
+            data = await request.json()
+            try:
+                return web.json_response({"ok": True, "folder": open_folder(str(data.get("path", "")))})
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 
