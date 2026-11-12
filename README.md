@@ -3,12 +3,12 @@
 **Load Image and Preview Image are the most used nodes in ComfyUI, and they deserve an overhaul.**
 This pack gives you both with everything you need for editing images where they live:
 
-- **Real paths.** "choose file" opens your system file dialog and keeps the real path. Nothing is copied to `input/`.
+- **Real paths.** Type or paste a full path, or pick a file: when the picked image is one of your ComfyUI outputs, the loader finds the original and keeps its real path.
 - **Handy outputs.** `image`, `mask`, `width`, `height`, `path`, so you don't need a Get Image Size node. One `sync` link carries original, path, mask, size and format to the preview.
 - **Compare built in.** Original vs. result under the image: slide, hold or off. No extra comparer node.
 - **Save next to the source.** `house.png` → `house_1.png`, `house_2.png`, …, never overwrites.
   **save as…** opens the system dialog in the source folder.
-- **Iterate.** **send to loader** puts the result back into the loader, so the next run edits the new image.
+- **Iterate.** **send to loader** (or **auto send**) puts the result back into the loader, so the next run edits the new image.
 - **One node instead of three.** Preview Image MM replaces Preview Image + Save Image + an image comparer.
 
 > **Prototype, still in the debugging phase.** Feedback and bug reports are very welcome. Feel free to comment or open an issue.
@@ -20,10 +20,9 @@ This pack gives you both with everything you need for editing images where they 
 ## Nodes
 
 ### Load Image MM
-- **choose file** opens your normal system file dialog (Windows, macOS, Linux with zenity/kdialog).
-  The real path shows in the node at once, before you run anything. No copy in `ComfyUI/input`.
-- `path` – full file path; wins over the upload list. You can also paste a path.
-- Without a desktop (server, container) or from another computer, **choose file** is the normal upload.
+- **choose file** is the browser's file picker; the image is uploaded to `ComfyUI/input` and shown at once.
+  If the same image exists in the ComfyUI output folder, `path` is set to that original.
+- `path` – full file path; wins over the upload list. You can also type or paste a path.
 - Outputs: `sync` (one link to Preview Image MM: path, original, mask, size, format), `image`, `mask`,
   `width`, `height`, `path`.
 
@@ -41,6 +40,10 @@ This pack gives you both with everything you need for editing images where they 
   (with `auto_save` on, the auto-saved file is used – no second copy).
 - A button an auto switch already covers is greyed out: **save** with `auto_save`, **send to loader** with `auto_send`.
 - Without a `sync` link, `source = auto` uses the Load Image MM upstream.
+
+## See also
+
+[Upscale Crop Universal MM](https://github.com/metamountain/upscale-universal) – upscale (with the model built in) and crop in one node, same **MM Nodepack** category.
 
 ## Install
 
@@ -69,8 +72,6 @@ No extra Python packages.
 > - Screenshot if possible
 >
 > Comments and feedback on any issue are appreciated.
-
-## License
 
 ## License
 
