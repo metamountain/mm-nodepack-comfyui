@@ -30,11 +30,11 @@ This pack gives you both with everything you need for editing images where they 
 ### Preview Image MM
 - Shows the result with a compare widget under the image: **compare slide** (move the mouse),
   **compare hold** (press to see the original, the default), **compare off**.
-- **save** – next free `_#` name next to the source, never overwrites.
-- **save as…** – your system "save as" dialog, starting in the source folder.
 - **send to loader** – saves as `_#` and puts it into the Load Image MM, so the next run edits the new image.
 - **open folder** – shows the last saved file in Explorer (else the folder the next save goes to);
   only in a browser on the ComfyUI computer.
+- **save** – next free `_#` name next to the source, never overwrites.
+- **save as…** – your system "save as" dialog, starting in the source folder.
 - `auto_save` on: every run saves all images. `suffix` (default `_#`, `#` = next free number),
   `save_as` (name or full path), `format` (same as source / png / jpg / webp), `quality`, `embed_workflow`.
 - `auto_send` on: after every run the result goes to the Load Image MM like **send to loader**

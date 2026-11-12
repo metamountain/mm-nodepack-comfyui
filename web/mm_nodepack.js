@@ -367,6 +367,10 @@ function addSaveButtons(node, entry, sourcePath, variant) {
       toast("error", "Open folder", String(e));
     }
   };
+  // the most used ones at the bottom: save and save as last
+  const order = [btn3, btn4, btn1, btn2];
+  for (const b of order) node.widgets.splice(node.widgets.indexOf(b), 1);
+  node.widgets.push(...order);
   node._rtButtons = [btn1, btn2, btn3, btn4];
   applyAutoState(node);
   node._rtRemoveButtons = () => {
