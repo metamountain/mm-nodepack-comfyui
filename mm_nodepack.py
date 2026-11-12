@@ -419,26 +419,6 @@ def is_local_request(remote: str) -> bool:
         return False
 
 
-def open_folder(p: str) -> str:
-    """Show p in the OS file manager: a file is selected in its folder, a folder is opened.
-    Returns the folder that was opened."""
-    import subprocess
-    import sys
-    p = os.path.abspath(_clean(p))
-    is_file = os.path.isfile(p)
-    folder = os.path.dirname(p) if is_file or not os.path.isdir(p) else p
-    if not os.path.isdir(folder):
-        raise FileNotFoundError(f"folder not found: {folder}")
-    if os.name == "nt":
-        if is_file:
-            subprocess.Popen(["explorer", "/select,", p])
-        else:
-            os.startfile(folder)  # noqa: S606
-    else:
-        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", folder])
-    return folder
-
-
 def dialog_available() -> bool:
     """An OS file dialog can open here (Linux: a desktop session and zenity/kdialog; a headless
     server or container has none -> the browser upload / save picker is used instead)."""
@@ -480,7 +460,7 @@ def file_dialog(mode: str, start_dir: str, name: str = "") -> str:
     t0 = time.time()
     env = dict(os.environ, MM_START=start_dir, MM_NAME=name)
     if os.name == "nt":
-        result = _win_file_dialog_tk(start_dir, name, save)
+        result = _win_file_dialog(start_dir, name, save)
     else:
         result = _posix_file_dialog(mode, start_dir, name, env)
     elapsed = time.time() - t0
@@ -513,134 +493,81 @@ def _posix_file_dialog(mode: str, start_dir: str, name: str, env: dict) -> str:
     return lines[-1] if lines else ""
 
 
-def _win_file_dialog_tk(start_dir: str, name: str, save: bool) -> str:
-    """Windows file dialog via COM IFileOpenDialog — instant, in-process,
-    guaranteed foreground (owner = GetForegroundWindow), any drive, full path."""
-    import ctypes
-    import uuid
-    from ctypes import wintypes
+# Windows open/save dialog: comdlg32 in a child process (a crash there cannot take ComfyUI down).
+# argv: mode ("open"|"save"), start_dir, name. Prints the chosen path as JSON, "" = cancelled.
+_WIN_DIALOG_SCRIPT = r'''
+import ctypes, json, os, sys
+from ctypes import wintypes
+mode, start_dir, name = sys.argv[1], sys.argv[2], sys.argv[3]
+save = mode == "save"
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+comdlg32 = ctypes.WinDLL("comdlg32")
+kernel32 = ctypes.WinDLL("kernel32")
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
-    ole32 = ctypes.OleDLL("Ole32")
-    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-    user32 = ctypes.WinDLL("User32", use_last_error=True)
+class OPENFILENAMEW(ctypes.Structure):
+    _fields_ = [("lStructSize", wintypes.DWORD), ("hwndOwner", wintypes.HWND),
+                ("hInstance", wintypes.HINSTANCE), ("lpstrFilter", wintypes.LPCWSTR),
+                ("lpstrCustomFilter", wintypes.LPWSTR), ("nMaxCustFilter", wintypes.DWORD),
+                ("nFilterIndex", wintypes.DWORD), ("lpstrFile", wintypes.LPWSTR),
+                ("nMaxFile", wintypes.DWORD), ("lpstrFileTitle", wintypes.LPWSTR),
+                ("nMaxFileTitle", wintypes.DWORD), ("lpstrInitialDir", wintypes.LPCWSTR),
+                ("lpstrTitle", wintypes.LPCWSTR), ("Flags", wintypes.DWORD),
+                ("nFileOffset", wintypes.WORD), ("nFileExtension", wintypes.WORD),
+                ("lpstrDefExt", wintypes.LPCWSTR), ("lCustData", wintypes.LPARAM),
+                ("lpfnHook", wintypes.LPVOID), ("lpTemplateName", wintypes.LPCWSTR),
+                ("pvReserved", wintypes.LPVOID), ("dwReserved", wintypes.DWORD),
+                ("FlagsEx", wintypes.DWORD)]
 
-    # --- COM init ---
-    ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED (STA — required for UI dialogs)
-
-    # --- GUID helper ---
-    class _GUID(ctypes.Structure):
-        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
-                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_byte * 8)]
-
-    def _g(s):
-        return _GUID.from_buffer_copy(uuid.UUID(s).bytes_le)
-
-    CLSID_FileOpenDialog = _g("DC1C5A9C-9B69-11d3-AF79-00C04F79C160")
-    IID_IFileOpenDialog = _g("d57c7288-d4ad-4768-be02-9d969532d960")
-    IID_IShellItem = _g("43826d1e-e718-42ee-bc55-a1e261c37bfe")
-
-    # --- Vtable function prototypes ---
-    # IUnknown: 0=QueryInterface, 1=AddRef, 2=Release
-    # IFileDialog: 3=Show, 4=SetOptions, 5=GetOptions, 6=SetDefaultFolder,
-    #   7=GetDefaultFolder, 8=SetFolder, 9=GetFolder, 10=GetFile,
-    #   11=SetFileName, 12=GetFileName
-    # IFileOpenDialog: 13=GetResults, 14=GetSelectedItems
-    PFN_Show = ctypes.WINFUNCTYPE(wintypes.HRESULT, wintypes.HWND)
-    PFN_SetOptions = ctypes.WINFUNCTYPE(wintypes.HRESULT, wintypes.DWORD)
-    PFN_GetFile = ctypes.WINFUNCTYPE(wintypes.HRESULT, ctypes.POINTER(ctypes.c_void_p))
-    PFN_SetFileName = ctypes.WINFUNCTYPE(wintypes.HRESULT, wintypes.LPCWSTR)
-    PFN_GetFileName = ctypes.WINFUNCTYPE(wintypes.HRESULT, ctypes.POINTER(wintypes.LPWSTR))
-    PFN_Release = ctypes.WINFUNCTYPE(wintypes.ULONG)
-    # IShellItem::GetDisplayName (index 2): (SIGDN, LPWSTR*)
-    PFN_GetDisplayName = ctypes.WINFUNCTYPE(wintypes.HRESULT, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR))
-
-    # --- Create IFileOpenDialog ---
-    pDialog = ctypes.c_void_p()
-    hr = ole32.CoCreateInstance(ctypes.byref(CLSID_FileOpenDialog), None, 1,
-                                ctypes.byref(IID_IFileOpenDialog), ctypes.byref(pDialog))
-    if hr != 0:
-        ole32.CoUninitialize()
-        raise RuntimeError(f"CoCreateInstance failed: 0x{hr & 0xFFFFFFFF:08x}")
-
-    # Get vtable: pDialog → vtable (array of function pointers)
-    vtbl = ctypes.cast(pDialog, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
-
-    def vcall(idx, proto):
-        return proto.from_address(ctypes.addressof(vtbl.contents) + idx * ctypes.sizeof(ctypes.c_void_p))
-
-    # --- Set options ---
-    FOS_OVERWRITEPROMPT = 0x2
-    FOS_PATHMUSTEXIST = 0x800
-    FOS_FILEMUSTEXIST = 0x1000
-    opts = FOS_PATHMUSTEXIST | (FOS_OVERWRITEPROMPT if save else FOS_FILEMUSTEXIST)
-    vcall(4, PFN_SetOptions)(opts)
-
-    # No initial folder — let Windows use its default (remembers last location itself)
-
-    # --- Set filename (for save: initial filename) ---
-    if name and save:
-        vcall(11, PFN_SetFileName)(name)
-
-    # --- Set file type filter ---
-    # Use SetFileTypes via IFileDialog::SetFileTypes (not in our vtable indices above)
-    # Skip for now — default is "All Files"
-
-    # --- Show dialog with a temporary topmost window as owner (guaranteed foreground) ---
-    kernel32 = ctypes.WinDLL("kernel32")
-    WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-    _wp = WNDPROC(lambda h, m, w, l: user32.DefWindowProcW(h, m, w, l))
-    _wp_ref = _wp  # keep alive
-
-    class _WC(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.UINT), ("style", wintypes.UINT),
-                    ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
-                    ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE),
-                    ("hIcon", wintypes.HICON), ("hCursor", wintypes.HANDLE),
-                    ("hbrBackground", wintypes.HBRUSH), ("lpszMenuName", wintypes.LPCWSTR),
-                    ("lpszClassName", wintypes.LPCWSTR), ("hIconSm", wintypes.HICON)]
-    wc = _WC()
-    wc.cbSize = ctypes.sizeof(_WC)
-    wc.lpfnWndProc = _wp_ref
-    wc.hInstance = kernel32.GetModuleHandleW(None)
-    wc.lpszClassName = "MM_TmpTopmost"
-    user32.RegisterClassExW(ctypes.byref(wc))
-
-    owner = user32.CreateWindowExW(
-        0x00000088, "MM_TmpTopmost", "", 0, 0, 0, 1, 1, None, None, wc.hInstance, None)
-    user32.SetForegroundWindow(owner)
-
-    hr = vcall(3, PFN_Show)(owner)
-    user32.DestroyWindow(owner)
-
-    result = ""
-    if hr == 0:  # S_OK
-        # GetFile(IShellItem**) → IShellItem::GetDisplayName(SIGDN_FILESYSPATH)
-        pShellItem = ctypes.c_void_p()
-        PFN_GetFile2 = ctypes.WINFUNCTYPE(wintypes.HRESULT, ctypes.POINTER(ctypes.c_void_p))
-        hr2 = vcall(10, PFN_GetFile2)(ctypes.byref(pShellItem))
-        if hr2 == 0 and pShellItem:
-            # IShellItem vtable: 0=BindToHandler, 1=GetParent, 2=GetDisplayName
-            si_vtbl = ctypes.cast(pShellItem, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
-            si_GetDisplayName = PFN_GetDisplayName.from_address(
-                ctypes.addressof(si_vtbl.contents) + 2 * ctypes.sizeof(ctypes.c_void_p))
-            pszPath = wintypes.LPWSTR()
-            SIGDN_FILESYSPATH = 0x80058000
-            hr3 = si_GetDisplayName(SIGDN_FILESYSPATH, ctypes.byref(pszPath))
-            if hr3 == 0 and pszPath:
-                result = pszPath.value or ""
-                ole32.CoTaskMemFree(pszPath)
-            # Release IShellItem
-            si_Release = PFN_Release.from_address(
-                ctypes.addressof(si_vtbl.contents) + 2 * ctypes.sizeof(ctypes.c_void_p))
-            si_Release()
-
-    # --- Cleanup: Release dialog ---
-    vcall(2, PFN_Release)()
-    ole32.CoUninitialize()
-    return result
+# ComfyUI runs in the background and Windows refuses focus to background processes:
+# invisible topmost owner window + ALT tap brings the dialog to the front
+owner = user32.CreateWindowExW(0x88, "STATIC", "MM Nodepack", 0x80000000, 0, 0, 0, 0,
+                               None, None, kernel32.GetModuleHandleW(None), None)
+user32.keybd_event(0x12, 0, 0, 0)
+user32.keybd_event(0x12, 0, 2, 0)
+user32.SetForegroundWindow(owner)
+# a full path in the name field is the only way to beat the dialog's remembered folder
+first = os.path.basename(name)
+if start_dir and os.path.isdir(start_dir):
+    first = os.path.join(start_dir, first)
+buf = ctypes.create_unicode_buffer(first, 32768)
+ofn = OPENFILENAMEW()
+ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+ofn.hwndOwner = owner
+ofn.lpstrFilter = "Images\0*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tif;*.tiff\0All files\0*.*\0\0"
+ofn.nFilterIndex = 1
+ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
+ofn.nMaxFile = len(buf)
+ofn.lpstrInitialDir = start_dir or None
+# OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | (OFN_OVERWRITEPROMPT or OFN_FILEMUSTEXIST)
+ofn.Flags = 0x80000 | 0x8 | 0x800 | (0x2 if save else 0x1000)
+if save:
+    ofn.lpstrDefExt = "png"
+ok = (comdlg32.GetSaveFileNameW if save else comdlg32.GetOpenFileNameW)(ctypes.byref(ofn))
+user32.DestroyWindow(owner)
+# shell extensions inside the dialog may print to stdout too: the result line is marked
+sys.stdout.write("\nMMPATH:" + json.dumps(buf.value if ok else "") + "\n")
+'''
 
 
-
+def _win_file_dialog(start_dir: str, name: str, save: bool) -> str:
+    """Windows open/save dialog, in front, starting in start_dir with name filled in."""
+    import json
+    import subprocess
+    import sys
+    r = subprocess.run([sys.executable, "-I", "-c", _WIN_DIALOG_SCRIPT, "save" if save else "open",
+                        start_dir or "", name or ""],
+                       capture_output=True, text=True, encoding="utf-8", timeout=3600)
+    if r.returncode != 0:
+        raise RuntimeError(f"file dialog failed: {(r.stderr or '').strip()[-300:]}")
+    lines = [x[7:] for x in (r.stdout or "").splitlines() if x.startswith("MMPATH:")]
+    if not lines:
+        raise RuntimeError("file dialog gave no answer")
+    return json.loads(lines[-1])
 
 
 def view_entry(p: str):
@@ -849,17 +776,6 @@ def register_routes():
                     start = folder_paths.get_output_directory()
                 p = await asyncio.to_thread(file_dialog, mode, os.path.abspath(start), os.path.basename(str(data.get("name", ""))))
                 return web.json_response({"ok": True, "path": p, "view": view_entry(p) if p and mode == "open" else None})
-            except Exception as e:  # noqa: BLE001
-                return web.json_response({"ok": False, "error": str(e)}, status=400)
-
-        @PromptServer.instance.routes.post("/mm-nodepack/open-folder")
-        async def _open_folder(request):
-            # the file manager opens on the ComfyUI computer -> only for a browser on that computer
-            if not is_local_request(request.remote):
-                return web.json_response({"ok": False, "error": "open folder only works in a browser on the ComfyUI computer"}, status=403)
-            data = await request.json()
-            try:
-                return web.json_response({"ok": True, "folder": open_folder(str(data.get("path", "")))})
             except Exception as e:  # noqa: BLE001
                 return web.json_response({"ok": False, "error": str(e)}, status=400)
 

@@ -274,7 +274,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     return j;
   };
   const stem = sourcePath ? String(sourcePath).replace(/\\/g, "/").split("/").pop().replace(/\.[^.]+$/, "") : "image";
-  const btn1 = mk("💾 save");
+  const btn1 = mk("save");
   btn1.tooltip = node._rtTarget || "next free _# name next to the source";
   // no known home folder -> save behaves like save as: pasted images (Ctrl+V -> input/pasted/) and
   // uploads whose original was not found (picking/uploading leaves the loader's path empty then)
@@ -286,7 +286,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     return /(^|\/)pasted\//i.test(p);
   };
   btn1.callback = () => (isPasted() ? btn2.callback() : serverSave(""));
-  const btn2 = mk("💾 save as…");
+  const btn2 = mk("save as…");
   btn2.tooltip = "choose folder and name";
   btn2.callback = async () => {
     const suggested = (node._rtTarget ? String(node._rtTarget).replace(/\\/g, "/").split("/").pop() : "") || `${stem}_edit.png`;
@@ -330,7 +330,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     else name = window.prompt("Save as (next to the source):", `${stem}_edit`);
     if (name != null && String(name).trim() !== "") await serverSave(String(name).trim());
   };
-  const btn3 = mk("↩ send to loader");
+  const btn3 = mk("send to loader");
   btn3.tooltip = "save as _# and load it in the Load Image MM (next run works on this creation)";
   // savedPath: auto_save already wrote this creation -> send that file instead of saving a second copy
   const sendToLoader = async (savedPath) => {
@@ -355,17 +355,14 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   };
   btn3.callback = () => sendToLoader();
   node._rtSendToLoader = sendToLoader;
-  const btn4 = mk("📂 open folder");
-  btn4.tooltip = "show the last saved file in its folder (else the folder the next save goes to)";
-  btn4.callback = async () => {
-    const path = node._rtLastSaved || node._rtTarget || sourcePath;
-    if (!path) return toast("warn", "Open folder", "nothing saved yet and no target folder");
-    try {
-      const j = await (await api.fetchApi("/mm-nodepack/open-folder", { method: "POST", body: JSON.stringify({ path }) })).json();
-      if (!j.ok) toast("error", "Open folder", j.error || "failed");
-    } catch (e) {
-      toast("error", "Open folder", String(e));
-    }
+  const btn4 = mk("open folder");
+  btn4.tooltip = "file picker (same as choose file in Load Image MM)";
+  // exactly what "choose file" does: the browser's own file picker, no server call
+  btn4.callback = () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.click();
   };
   // the most used ones at the bottom: save and save as last
   const order = [btn3, btn4, btn1, btn2];
