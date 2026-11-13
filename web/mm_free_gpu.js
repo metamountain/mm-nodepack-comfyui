@@ -25,10 +25,13 @@ async function freeGpu() {
 
 const TIP = "Unload all models and free the cache (GPU and RAM). Takes effect after the running job.";
 
-// Slim label like the VRAM monitor next to it (Inter 100, 10 px)
+// Like the VRAM monitor next to it: slim label (Inter 100, 10 px) at the bottom, bigger icon
+const B = `[data-testid="action-bar-buttons"] button[aria-label="${TIP}"]`;
 const style = document.createElement("style");
-style.textContent = `[data-testid="action-bar-buttons"] button[aria-label="${TIP}"],
-[data-testid="action-bar-buttons"] button[aria-label="${TIP}"] * { font: 100 10px Inter, Arial, sans-serif; color: #fff; }`;
+style.textContent = `${B}, ${B} * { font: 100 10px/12px Inter, Arial, sans-serif; color: #fff; }
+${B} { gap: 4px; }
+${B} > i { width: 22px; height: 22px; }
+${B} > span { align-self: flex-end; margin-bottom: 2px; }`;
 document.head.appendChild(style);
 
 app.registerExtension({
