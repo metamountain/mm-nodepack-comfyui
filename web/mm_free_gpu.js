@@ -21,7 +21,22 @@ async function freeGpu() {
   } catch (e) {
     toast("error", "free GPU", String(e?.message || e));
   }
+  setTimeout(showUsage, 1500);
 }
+
+// What ComfyUI itself holds on the GPU (memory PyTorch reserved), next to the label – the monitor beside it shows the
+// whole GPU, other programs included.
+async function showUsage() {
+  const span = document.querySelector(`${B} > span`);
+  if (!span) return;
+  try {
+    const d = (await (await api.fetchApi("/system_stats")).json())?.devices?.[0];
+    const gb = d && d.torch_vram_total != null ? d.torch_vram_total / 1073741824 : null;
+    span.textContent = gb == null ? "free GPU" : `free GPU · ${gb.toFixed(1)} GB`;
+    span.parentElement.title = TIP + (gb == null ? "" : `\nComfyUI holds ${gb.toFixed(1)} GB of GPU memory now.`);
+  } catch { /* server restarting */ }
+}
+setInterval(showUsage, 3000);
 
 const TIP = "Unload all models and free the cache (GPU and RAM). Takes effect after the running job.";
 
