@@ -23,13 +23,21 @@ async function freeGpu() {
   }
 }
 
+const TIP = "Unload all models and free the cache (GPU and RAM). Takes effect after the running job.";
+
+// Slim label like the VRAM monitor next to it (Inter 100, 10 px)
+const style = document.createElement("style");
+style.textContent = `[data-testid="action-bar-buttons"] button[aria-label="${TIP}"],
+[data-testid="action-bar-buttons"] button[aria-label="${TIP}"] * { font: 100 10px Inter, Arial, sans-serif; color: #fff; }`;
+document.head.appendChild(style);
+
 app.registerExtension({
   name: "MM.FreeGpu",
   actionBarButtons: [
     {
       icon: "icon-[lucide--cpu] size-4",
       label: "free GPU",
-      tooltip: "Unload all models and free the cache (GPU and RAM). Takes effect after the running job.",
+      tooltip: TIP,
       onClick: freeGpu,
     },
   ],
