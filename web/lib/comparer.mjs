@@ -4,7 +4,7 @@
 // Modes (button under the image, node property mm_compare): slide (rgthree "Slide"),
 // hold (rgthree "Click": original while the mouse button is held), off.
 import { app } from "../../../scripts/app.js";
-import { api } from "../../../scripts/api.js";
+import { MM_THEME, loadImage } from "./mm_ui.js";
 
 const MODES = ["hold", "slide", "off"];   // hold = default, first in the cycle
 const MODE_LABEL = { slide: "compare slide", hold: "compare hold", off: "compare off" };
@@ -16,14 +16,6 @@ export function compareMode(node) {
   return MODES.includes(m) ? m : "hold";
 }
 
-const LABEL = "rgba(170,170,170,.85)", LABEL_HI = "rgba(225,225,225,1)", DIM = "rgba(150,150,150,.6)";
-
-function loadImage(entry) {
-  const img = new Image();
-  const q = new URLSearchParams({ filename: entry.filename, subfolder: entry.subfolder || "", type: entry.type || "temp" });
-  img.src = api.apiURL("/view?" + q + (app.getPreviewFormatParam?.() ?? "") + (app.getRandParam?.() ?? ""));
-  return img;
-}
 // ---------------------------------------------------------------------------
 // Compare slider widget (slide mode: original full, result up to the pointer x).
 // Ported from rgthree-comfy image_comparer.js (MIT): drawImage with cropX,
@@ -146,7 +138,7 @@ export class ComparerWidget {
       let x = Math.max(4, (W - parts.reduce((acc, p) => acc + p.w + 4, -4)) / 2);
       ctx.textAlign = "left";
       parts.forEach((p, i) => {
-        ctx.fillStyle = i === this.selected ? LABEL_HI : "rgba(150,150,150,.6)";
+        ctx.fillStyle = i === this.selected ? MM_THEME.labelHi : MM_THEME.dim;
         ctx.fillText(p.label, x + 4, y + 3);
         this.barBounds.push({ x, y, w: p.w, i });
         x += p.w + 4;
@@ -166,15 +158,15 @@ export class ComparerWidget {
       const leftShare = cropX != null ? cropX / W : 0;
       ctx.textAlign = "left";
       if (hasA) {
-        ctx.fillStyle = held || (over && leftShare > 0.5) ? LABEL_HI : LABEL;
+        ctx.fillStyle = held || (over && leftShare > 0.5) ? MM_THEME.labelHi : MM_THEME.label;
         const sid = node._rtSrcId || node._rtSrcIdLive;
         ctx.fillText(sid ? `◀ ORIGINAL #${sid}` : "◀ ORIGINAL", 8, y + 3);
       } else if (compare && (node._rtNote || node._rtSrcNote)) {
-        ctx.fillStyle = LABEL;
+        ctx.fillStyle = MM_THEME.label;
         ctx.fillText(node._rtNote || node._rtSrcNote, 8, y + 3);
       }
       ctx.textAlign = "right";
-      ctx.fillStyle = !held && (!over || leftShare <= 0.5) ? LABEL_HI : LABEL;
+      ctx.fillStyle = !held && (!over || leftShare <= 0.5) ? MM_THEME.labelHi : MM_THEME.label;
       ctx.fillText(creation + " ▶", W - 8, y + 3);
       y += 16;
     }
@@ -194,26 +186,25 @@ export class ComparerWidget {
       if (haveA) {
         // toggle under the image, drawn exactly like ComfyUI's own button widget
         // (frontend ButtonWidget: margin 15, widget height, theme colors, label at 0.7 height)
-        const LG = window.LiteGraph || {};
-        const bh = LG.NODE_WIDGET_HEIGHT || 20, bx = 15, bw = W - 30, by = r.bottom + 4;
+        const bh = (window.LiteGraph || {}).NODE_WIDGET_HEIGHT || 20, bx = 15, bw = W - 30, by = r.bottom + 4;
         ctx.font = font;
-        ctx.fillStyle = LG.WIDGET_BGCOLOR || "#222";
+        ctx.fillStyle = MM_THEME.widgetBg;
         ctx.fillRect(bx, by, bw, bh);
-        ctx.strokeStyle = LG.WIDGET_OUTLINE_COLOR || "#666";
+        ctx.strokeStyle = MM_THEME.outline;
         ctx.lineWidth = 1;
         ctx.strokeRect(bx, by, bw, bh);
         ctx.textAlign = "center";
         ctx.textBaseline = "alphabetic";
-        ctx.fillStyle = LG.WIDGET_TEXT_COLOR || "#DDD";
+        ctx.fillStyle = MM_THEME.text;
         ctx.fillText(MODE_LABEL[mode], W / 2, by + bh * 0.7);
         this.toggleBounds = { x: bx, y: by, w: bw, h: bh };
         ctx.font = "10px Arial";
         ctx.textBaseline = "top";
-        ctx.fillStyle = LABEL;
+        ctx.fillStyle = MM_THEME.label;
         ctx.fillText(sa + sb, W / 2, by + bh + 3);
       } else {
         ctx.textAlign = "center";
-        ctx.fillStyle = LABEL;
+        ctx.fillStyle = MM_THEME.label;
         ctx.fillText(sb, W / 2, r.bottom + 2);
       }
       ctx.restore();

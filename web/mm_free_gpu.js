@@ -1,9 +1,10 @@
-// MM Nodepack · free GPU – one button in the top action bar (2026-11-13).
+// MM Nodepack · free GPU – one button in the top action bar.
 // Unloads all models and frees the cache (ComfyUI's own POST /free), like the button the old ComfyUI-Manager menu had.
 // Top right: the GPU memory ComfyUI itself holds (PyTorch reserved) – the monitor beside it shows the whole GPU,
 // other programs included. No polling: refreshed on page load, after the click and when a run starts or ends.
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { toast } from "./lib/mm_ui.js";
 
 const TIP = "Unload all models and free the cache (GPU and RAM). Takes effect after the running job.";
 const B = `[data-testid="action-bar-buttons"] button[aria-label="${TIP}"]`;
@@ -18,12 +19,6 @@ ${B} > .mm-gb { position: absolute; top: 2px; right: 6px; font: 500 11px/14px In
 ${B} > i { width: 22px; height: 22px; }
 ${B} > span { align-self: flex-end; margin-bottom: 2px; }`;
 document.head.appendChild(style);
-
-function toast(severity, summary, detail) {
-  const t = app.extensionManager?.toast;
-  if (t?.add) t.add({ severity, summary, detail, life: 2500 });
-  else console.log(`[MM free GPU] ${summary}: ${detail}`);
-}
 
 async function showUsage() {
   const span = document.querySelector(`${B} > span`);

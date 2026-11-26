@@ -12,3 +12,8 @@ Repository = "https://github.com/metamountain/mm-nodepack-comfyui"
 PublisherId = "metamountain"
 DisplayName = "MM Nodepack"
 includes = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = ["--import-mode=importlib"]
