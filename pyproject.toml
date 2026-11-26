@@ -1,7 +1,7 @@
 [project]
 name = "mm-nodepack-comfyui"
-description = "Load an image with its real path (system file dialog), compare the result with the original, save it next to the source (name_1, name_2 …) or send it back to the loader and keep editing."
-version = "0.1.1"
+description = "Four minimal, unified ComfyUI V3 nodes: Load Image MM, Preview Image MM, Upscale Crop MM, and LLM Multitool MM."
+version = "0.2.0"
 license = { file = "LICENSE" }
 dependencies = []
 
@@ -11,6 +11,7 @@ Repository = "https://github.com/metamountain/mm-nodepack-comfyui"
 [tool.comfy]
 PublisherId = "metamountain"
 DisplayName = "MM Nodepack"
+Icon = "https://raw.githubusercontent.com/metamountain/mm-nodepack-comfyui/main/assets/logo.svg"
 includes = []
 
 [tool.pytest.ini_options]

@@ -4,7 +4,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-import { fitNodeSize, toast } from "./lib/mm_ui.js";
+import { fitNodeSize, toast } from "./lib/mm_ui.mjs";
 
 const NODE = "MMLLMMultitool";
 const SERVER_CHOICE = "server (api_url)";

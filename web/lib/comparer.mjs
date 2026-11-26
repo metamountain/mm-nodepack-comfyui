@@ -4,7 +4,7 @@
 // Modes (button under the image, node property mm_compare): slide (rgthree "Slide"),
 // hold (rgthree "Click": original while the mouse button is held), off.
 import { app } from "../../../scripts/app.js";
-import { MM_THEME, loadImage } from "./mm_ui.js";
+import { MM_THEME, loadImage } from "./mm_ui.mjs";
 
 const MODES = ["hold", "slide", "off"];   // hold = default, first in the cycle
 const MODE_LABEL = { slide: "compare slide", hold: "compare hold", off: "compare off" };

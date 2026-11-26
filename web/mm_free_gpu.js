@@ -4,7 +4,7 @@
 // other programs included. No polling: refreshed on page load, after the click and when a run starts or ends.
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { toast } from "./lib/mm_ui.js";
+import { toast } from "./lib/mm_ui.mjs";
 
 const TIP = "Unload all models and free the cache (GPU and RAM). Takes effect after the running job.";
 const B = `[data-testid="action-bar-buttons"] button[aria-label="${TIP}"]`;

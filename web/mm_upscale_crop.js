@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-import { MM_THEME, setWidgetVisible, fitNodeSize, debounce } from "./lib/mm_ui.js";
+import { MM_THEME, setWidgetVisible, fitNodeSize, debounce } from "./lib/mm_ui.mjs";
 
 // Upscale Crop MM -- widget visibility and the live preview panel.
 //

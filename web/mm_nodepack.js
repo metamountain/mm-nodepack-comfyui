@@ -5,7 +5,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import {
   toast, debounce, viewBlob, loadImage, setWidgetVisible, setWidgetDim, fitNodeSize,
-} from "./lib/mm_ui.js";
+} from "./lib/mm_ui.mjs";
 
 const SAVE_NODES = new Set(["MMPreviewImage"]);
 const LOADER = "MMLoadImage";
