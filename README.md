@@ -20,7 +20,7 @@ The basics ComfyUI is missing. Load from anywhere, save next to the source, send
 
 ## What it's for
 
-Edit loops, folder captioning, frame-by-frame movie work. Fewer nodes, fewer steps.
+Edit loops, folder captioning, frame-by-frame movie work. Fewer nodes, fewer steps - simpler life.
 
 ## Install
 
