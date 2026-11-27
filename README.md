@@ -54,6 +54,10 @@ The policy switches on automatically when ComfyUI starts with a non-loopback `--
 
 On a private (loopback-only) server, every **non-local** request is still restricted in the same way; trusted local requests keep the unrestricted behaviour, including OS-dialog files outside the ComfyUI tree and saves next to the source.
 
+### LLM targets on a shared server
+
+The same switch also binds `LLM Multitool MM` to operator-owned profiles: on a shared server, a workflow (queued node) or the `/mm/llm/unload` route may only talk to a target whose **backend + base URL + credential env-var name** matches a profile from the JSON file set in **`MM_NODEPACK_LLM_PROFILES`**. Profiles additionally grant lifecycle permissions (remote unload, stopping the managed local `llama-server`, starting/selecting a local GGUF) and cap the response size. Unknown combinations fail with a redacted error before any credential is read or connection made; on a private loopback server (and for trusted local requests) the node works exactly as before.
+
 ## Notes
 
 - Pasted images (`Ctrl+V`) have no original folder on disk, so **save** opens the save dialog to ask where to store them.

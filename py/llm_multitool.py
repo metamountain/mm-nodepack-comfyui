@@ -16,6 +16,17 @@ Ported 1:1 from the standalone LLM_Multitool custom node:
 Route (answering {"ok": ...} JSON):
   /mm/llm/unload -- the node's "unload model" button: stops the own local
                     server and frees the VRAM of the model at api_url
+
+Shared-server policy: when the server policy is active (py.access_policy,
+same switch as the file policy), every LLM request -- queued node as well as
+the unload route, which has no browser request to authenticate -- must match
+an operator-owned profile from the JSON file named by env MM_NODEPACK_LLM_PROFILES
+before any env credential is read, any discovery happens, any connection is
+opened or any process (local llama-server) is started or stopped. Profiles
+bind backend + allowed base URL + credential env-var name, grant lifecycle
+permissions (remote unload, own-server stop, local model start/select) and
+cap the response size. Unknown combinations are rejected with a redacted
+error (no key, no env-var value, no URL with credentials).
 """
 import atexit
 import base64
@@ -29,6 +40,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import urlsplit
 
 import requests
 from io import BytesIO
@@ -38,7 +50,7 @@ from PIL import Image
 
 from comfy_api.latest import io
 
-from .common import CATEGORY, get_folder_paths, json_error
+from .common import CATEGORY, get_folder_paths, is_local_request, json_error, policy_active
 
 # =============================================================================
 #  HELP TEXTS
@@ -50,20 +62,25 @@ HELP = {
     "api_url":
         "Base URL of the server (llama.cpp, Ollama, LM Studio, vLLM, OpenAI ...).\n"
         "Default: http://127.0.0.1:8080 (Ollama: http://127.0.0.1:11434).\n"
-        "Ignored when local_model is set.",
+        "Ignored when local_model is set.\n"
+        "On a shared server the URL must match an operator profile\n"
+        "(env MM_NODEPACK_LLM_PROFILES) before it may be contacted.",
 
     "api_key_env":
         "Name of the environment variable that holds the API key\n"
         "(e.g. OPENAI_API_KEY, GEMINI_API_KEY).\n"
         "The key is read via os.environ.get() at run time -- it is NEVER\n"
         "stored in the workflow file.\n"
-        "Leave empty if the server needs no key (local servers).",
+        "Leave empty if the server needs no key (local servers).\n"
+        "On a shared server the variable must be the one named in the\n"
+        "approved operator profile (env MM_NODEPACK_LLM_PROFILES).",
 
     "unload_after":
         "Unload the model after the request finishes.\n"
         "  llama.cpp / router -- POST /models/unload (frees VRAM)\n"
         "  ollama             -- keep_alive 0 in the request\n"
         "  openai / unsloth   -- no effect (cloud / managed)\n"
+        "On a shared server the profile must grant 'allow_unload' for it.\n"
         "Recommended: True when sharing the GPU with ComfyUI rendering.",
 
     # Mode
@@ -173,7 +190,10 @@ HELP = {
         "Optional JSON object merged into the request last,\n"
         "overriding any field above. Example:\n"
         "  {\"top_k\": 20, \"cache_prompt\": true}\n"
-        "Leave empty for none.",
+        "Reserved fields may NOT be overridden: model, messages, stream,\n"
+        "max-token limits (max_tokens / num_predict / ...), and any\n"
+        "url / auth / token / header-like key -- also nested in backend\n"
+        "options. Leave empty for none.",
 
     "local_model":
         "Model to run:\n"
@@ -182,7 +202,10 @@ HELP = {
         "                      GGUF (+ its mmproj for vision); api_url is ignored.\n"
         "  <gguf> (text)    -- no mmproj next to it: text only, no images.\n"
         "Scans the HF cache and ComfyUI models/LLM, text_encoders, clip\n"
-        "(and extra_model_paths.yaml) for GGUF files. Switching restarts the server.",
+        "(and extra_model_paths.yaml) for GGUF files. Switching restarts the server.\n"
+        "On a shared server only profiles (env MM_NODEPACK_LLM_PROFILES) with\n"
+        "'allow_local_model' may start a server; their local_models list\n"
+        "can narrow which models are offered.",
 
     "keep_alive":
         "Ollama only: seconds the model stays loaded after the reply.\n"
@@ -318,12 +341,16 @@ def _build_headers(api_key: str) -> dict:
 BACKENDS = ["llama.cpp", "ollama", "openai", "unsloth"]
 
 
-def _get_active_model(base_url: str, api_key: str, backend: str):
+def _get_active_model(base_url: str, api_key: str, backend: str, cap: int = None):
     """Ask the server which model it serves -> (model_id, extra_payload, error_or_None)
 
     unsloth  : GET /api/inference/status (also yields gguf_variant)
     ollama   : GET /api/tags (first model)
     otherwise: GET /v1/models, first entry
+
+    `cap` = profile response-size limit: the body is read chunk-wise and
+    bounded before JSON decoding. Credentialed requests never follow
+    redirects (a key must not leak to a hop outside the approved URL).
     """
     if backend == "ollama":
         endpoint = "/api/tags"
@@ -336,16 +363,21 @@ def _get_active_model(base_url: str, api_key: str, backend: str):
             f"{base_url}{endpoint}",
             headers=_build_headers(api_key),
             timeout=15,
+            stream=cap is not None,
+            allow_redirects=not api_key,
         )
         r.raise_for_status()
-        data = r.json()
+        data = _json_capped(r, cap) if cap is not None else r.json()
         if backend == "ollama":
             models = data.get("models") or []
             if not models:
                 return None, {}, "Ollama lists no model -- pull one first (ollama pull <name>)."
             try:   # prefer a model that is already in VRAM
-                ps = requests.get(f"{base_url}/api/ps", headers=_build_headers(api_key),
-                                  timeout=15).json().get("models") or []
+                ps_r = requests.get(f"{base_url}/api/ps", headers=_build_headers(api_key),
+                                    timeout=15, stream=cap is not None,
+                                    allow_redirects=not api_key)
+                ps_r.raise_for_status()
+                ps = (_json_capped(ps_r, cap) if cap is not None else ps_r.json()).get("models") or []
                 if ps:
                     return ps[0].get("name") or "unknown", {}, None
             except Exception:
@@ -399,6 +431,214 @@ def _parse_extra_body(text: str):
     if not isinstance(extra, dict):
         return None, "extra_body must be a JSON object, e.g. {\"top_k\": 20}"
     return extra, None
+
+
+# =============================================================================
+#  SHARED-SERVER LLM POLICY (profiles)
+#  When the server policy is active (py.access_policy / common.policy_active),
+#  workflow fields must be mapped to an operator-owned profile BEFORE any env
+#  credential is read, any discovery, connection or process change happens.
+#  Profiles live in a JSON file pointed to by env MM_NODEPACK_LLM_PROFILES:
+#
+#    {"profiles": [
+#      {"id": "ninfer",
+#       "backends": ["llama.cpp"],
+#       "urls": ["http://127.0.0.1:8080"],
+#       "api_key_env": "NINFER_API_KEY",
+#       "allow_unload": true,          # remote unload (route + unload_after)
+#       "allow_local_unload": false,   # stop the managed local llama-server
+#       "allow_local_model": true,     # start a local llama-server
+#       "local_models": ["Qwen3.8"],   # optional: only these labels
+#       "max_response_bytes": 2097152}]}
+#
+#  On a private (policy-inactive) server none of this applies: workflows keep
+#  the unrestricted behaviour.
+# =============================================================================
+
+DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024    # cap when a profile sets none
+_PROFILE_ENV   = "MM_NODEPACK_LLM_PROFILES"
+_profile_cache = {"path": None, "mtime": None, "profiles": None}   # mtime-keyed
+
+
+class _ResponseTooLarge(Exception):
+    """The response body exceeds the profile's max_response_bytes."""
+
+    def __init__(self, max_bytes: int):
+        super().__init__(f"response exceeds the {max_bytes} byte limit of the approved profile")
+        self.max_bytes = max_bytes
+
+
+def _json_capped(resp, max_bytes: int):
+    """Read `resp` body chunk-wise, bounded at max_bytes bytes (checked while
+    streaming, before any JSON decoding). Always closes the response."""
+    chunks, total = [], 0
+    try:
+        for chunk in resp.iter_content(chunk_size=65536, decode_content=True):
+            total += len(chunk)
+            if total > max_bytes:
+                raise _ResponseTooLarge(max_bytes)
+            chunks.append(chunk)
+    finally:
+        resp.close()
+    return json.loads(b"".join(chunks).decode("utf-8"))
+
+
+def _bounded_text(resp, limit: int) -> str:
+    """Up to `limit` bytes of the response body as text (error diagnostics on
+    a shared server must not bypass the profile's size cap)."""
+    try:
+        chunks, total = [], 0
+        for chunk in resp.iter_content(chunk_size=8192, decode_content=True):
+            total += len(chunk)
+            if total > limit:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 -- closed/already-consumed body: nothing to show
+        return ""
+
+
+def _redacted_host(url: str) -> str:
+    """Host:port of `url` without scheme or user:pass credentials (for errors)."""
+    try:
+        netloc = urlsplit(_normalize_url(url)).netloc or ""
+        netloc = netloc.split("@")[-1]
+        return netloc or "unknown host"
+    except Exception:  # noqa: BLE001 -- never leak the raw url on a parse error
+        return "unknown host"
+
+
+def _validate_profile(doc) -> dict:
+    """Coerce one raw profile entry into a validated dict (defaults applied)."""
+    if not isinstance(doc, dict):
+        raise ValueError("every profile must be a JSON object")
+    p = {"id": str(doc.get("id") or "profile")}
+    backends = doc.get("backends")
+    urls = doc.get("urls")
+    if not isinstance(backends, list) or not backends or not all(isinstance(b, str) for b in backends):
+        raise ValueError(f"profile '{p['id']}': 'backends' must be a non-empty list of strings")
+    if not isinstance(urls, list) or not urls or not all(isinstance(u, str) for u in urls):
+        raise ValueError(f"profile '{p['id']}': 'urls' must be a non-empty list of strings")
+    key_env = doc.get("api_key_env", "")
+    if not isinstance(key_env, str):
+        raise ValueError(f"profile '{p['id']}': 'api_key_env' must be a string ('' = no key)")
+    lm = doc.get("local_models")
+    if lm is not None and (not isinstance(lm, list) or not all(isinstance(m, str) for m in lm)):
+        raise ValueError(f"profile '{p['id']}': 'local_models' must be a list of strings")
+    cap = doc.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
+    if not isinstance(cap, int) or cap <= 0:
+        raise ValueError(f"profile '{p['id']}': 'max_response_bytes' must be a positive integer")
+    p.update({
+        "backends": list(backends),
+        "urls": [_normalize_url(u) for u in urls],
+        "api_key_env": key_env.strip(),
+        "allow_unload": bool(doc.get("allow_unload", False)),
+        "allow_local_unload": bool(doc.get("allow_local_unload", False)),
+        "allow_local_model": bool(doc.get("allow_local_model", False)),
+        "local_models": list(lm) if lm else None,
+        "max_response_bytes": cap,
+    })
+    return p
+
+
+def _load_profiles():
+    """Profiles of the operator (env MM_NODEPACK_LLM_PROFILES -> JSON file),
+    cached by file mtime -> (profiles_or_None, error_or_None)."""
+    path = os.environ.get(_PROFILE_ENV, "").strip()
+    if not path:
+        return None, (f"this shared server has no LLM profiles configured -- "
+                      f"the operator must set env {_PROFILE_ENV} to a JSON profile file")
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return None, f"the LLM profile file configured by {_PROFILE_ENV} is missing or unreadable"
+    if _profile_cache["path"] == path and _profile_cache["mtime"] == mtime and _profile_cache["profiles"] is not None:
+        return _profile_cache["profiles"], None
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        raw = doc["profiles"] if isinstance(doc, dict) else doc
+        if not isinstance(raw, list):
+            raise ValueError("'profiles' must be a list")
+        profiles = [_validate_profile(e) for e in raw]
+    except Exception as exc:  # noqa: BLE001 -- redacted: no file path in the message
+        return None, f"the LLM profile file is invalid ({type(exc).__name__}) -- contact the operator"
+    _profile_cache.update(path=path, mtime=mtime, profiles=profiles)
+    return profiles, None
+
+
+def _match_remote(profile: dict, base_url: str, backend: str, api_key_env: str):
+    """True when the workflow combination matches this remote profile exactly:
+    backend dialect, normalized base URL and credential env-var name."""
+    return (backend in profile["backends"]
+            and base_url in profile["urls"]
+            and api_key_env.strip() == profile["api_key_env"])
+
+
+def _resolve_remote_profile(api_url: str, backend: str, api_key_env: str, forced: bool = False):
+    """Map (api_url, backend, api_key_env) onto an approved profile.
+
+    -> (profile_or_None, error_or_None). policy inactive (and not forced):
+    (None, None) = no restriction. `forced` applies the profile gate to a
+    non-local route request even on a private server. Never echoes
+    credentials or a URL with credentials."""
+    if not (policy_active() or forced):
+        return None, None
+    profiles, err = _load_profiles()
+    if err:
+        return None, err
+    base = _normalize_url(api_url)
+    for p in profiles:
+        if _match_remote(p, base, backend, api_key_env):
+            return p, None
+    host = _redacted_host(api_url)
+    return None, (f"no approved LLM profile matches {host} with backend '{backend}' and "
+                 f"credential variable '{api_key_env.strip() or '<none>'}' -- only operator-approved "
+                 f"profiles (env {_PROFILE_ENV}) may be used on this shared server")
+
+
+def _resolve_local_profile(label: str):
+    """Approve a local GGUF label -> (profile_or_None, error_or_None).
+
+    A local run is bound to the first profile that allows starting the
+    managed llama-server and does not exclude the label via its optional
+    local_models list. A label missing on this machine still passes the
+    profile gate: _ensure_local_server() reports the honest scan error."""
+    if not policy_active():
+        return None, None
+    profiles, err = _load_profiles()
+    if err:
+        return None, err
+    for p in profiles:
+        if not p["allow_local_model"]:
+            continue
+        if p["local_models"] is not None and label not in p["local_models"]:
+            continue
+        return p, None
+    return None, ("local model access is not approved on this shared server -- the operator must "
+                 f"allow it in a profile (env {_PROFILE_ENV})")
+
+
+def _check_extra_body(extra: dict):
+    """Error when extra_body overrides reserved / operator-owned fields (model
+    selection, response limits, streaming, url/auth-like keys) -- also inside
+    nested backend options like Ollama's 'options' object."""
+    reserved = {"model", "models", "stream", "messages", "max_tokens",
+                "num_predict", "max_completion_tokens"}
+    urlish = re.compile(r"(url|uri|endpoint|host|port|api[_-]?key|token|auth|header|secret|credential)", re.I)
+
+    def walk(d: dict, where: str):
+        for k, v in d.items():
+            ks = str(k)
+            if k in reserved or urlish.search(ks):
+                return f"extra_body may not override the reserved field '{ks}' {where}"
+            if isinstance(v, dict):
+                e = walk(v, f"inside '{ks}'")
+                if e:
+                    return e
+        return None
+
+    return walk(extra, "of the payload")
 
 
 # =============================================================================
@@ -520,8 +760,24 @@ def _local_models_cached(force=False):
 def _local_model_options():
     """Combo options for the local_model widget: the server choice first, then
     every GGUF the scan found. Outside a ComfyUI runtime (unit tests) the
-    scan simply returns nothing, which is all the widget can list."""
-    return [SERVER_CHOICE] + list(_local_models_cached())
+    scan simply returns nothing, which is all the widget can list.
+
+    On a shared server only models an operator profile allows
+    (allow_local_model + optional local_models list) are listed; with no
+    profile configured or a broken profile file the list fails closed to
+    the server choice only (execution re-checks the same rules)."""
+    found = _local_models_cached()
+    if not policy_active():
+        return [SERVER_CHOICE] + list(found)
+    approved = set()
+    profiles, _err = _load_profiles()
+    if profiles:
+        for p in profiles:
+            if not p["allow_local_model"]:
+                continue
+            names = set(found) if p["local_models"] is None else set(found) & set(p["local_models"])
+            approved |= names
+    return [SERVER_CHOICE] + [m for m in found if m in approved]
 
 
 def _local_alias(label: str) -> str:
@@ -594,32 +850,49 @@ def _stop_local_server():
 atexit.register(_stop_local_server)
 
 
-def _unload_remote(api_url: str, backend: str, api_key: str = ""):
+def _post_quiet(url: str, payload: dict, h: dict, timeout: int, cap: int = None) -> bool:
+    """POST without parsing the reply (bounded read when a cap applies).
+    Credentialed requests never follow redirects."""
+    r = requests.post(url, json=payload, headers=h, timeout=timeout,
+                      stream=cap is not None, allow_redirects=not h.get("Authorization"))
+    ok = r.ok
+    if cap is not None:
+        _json_capped(r, cap)    # drains (and closes) the body within the cap
+    # unstreamed: requests already consumed the body, nothing left to close
+    return ok
+
+
+def _unload_remote(api_url: str, backend: str, api_key: str = "", cap: int = None):
     """Free the VRAM of the server at api_url -> (unloaded_names, note).
 
     llama.cpp router : POST /models/unload for every loaded / sleeping / loading model
     plain llama-server: no unload API -> note only
     ollama           : keep_alive 0 for every model in /api/ps
     openai / unsloth : nothing to unload
+
+    `cap` = profile response-size limit (bounded reads, before JSON decoding).
     """
     base, h, done = _normalize_url(api_url), _build_headers(api_key), []
     try:
         if backend == "ollama":
-            for m in requests.get(f"{base}/api/ps", headers=h, timeout=10).json().get("models") or []:
+            ps_r = requests.get(f"{base}/api/ps", headers=h, timeout=10,
+                                stream=cap is not None, allow_redirects=not api_key)
+            ps_r.raise_for_status()
+            for m in (_json_capped(ps_r, cap) if cap is not None else ps_r.json()).get("models") or []:
                 name = m.get("name") or m.get("model")
-                requests.post(f"{base}/api/generate", json={"model": name, "keep_alive": 0},
-                              headers=h, timeout=30)
+                _post_quiet(f"{base}/api/generate", {"model": name, "keep_alive": 0}, h, 30, cap)
                 done.append(name)
             return done, "" if done else "Ollama has no model loaded."
         if backend == "llama.cpp":
-            models = requests.get(f"{base}/v1/models", headers=h, timeout=10).json().get("data") or []
+            models_r = requests.get(f"{base}/v1/models", headers=h, timeout=10,
+                                    stream=cap is not None, allow_redirects=not api_key)
+            models_r.raise_for_status()
+            models = (_json_capped(models_r, cap) if cap is not None else models_r.json()).get("data") or []
             if not any(isinstance(m.get("status"), dict) for m in models):
                 return [], "plain llama-server has no unload API -- stop that server yourself."
             for m in models:
                 if (m.get("status") or {}).get("value") in ("loaded", "sleeping", "loading"):
-                    r = requests.post(f"{base}/models/unload", json={"model": m["id"]},
-                                      headers=h, timeout=30)
-                    if r.ok:
+                    if _post_quiet(f"{base}/models/unload", {"model": m["id"]}, h, 30, cap):
                         done.append(m["id"])
             return done, "" if done else "router has no model loaded."
         return [], f"{backend}: nothing to unload (cloud / managed server)."
@@ -629,24 +902,35 @@ def _unload_remote(api_url: str, backend: str, api_key: str = ""):
         return done, f"unload failed: {exc}"
 
 
-def _unload_all(api_url="", backend="llama.cpp", api_key_env=""):
-    """'unload model' button: own local server + model at api_url -> (any_unloaded, message)."""
+def _unload_all(api_url="", backend="llama.cpp", api_key_env="",
+               local_ok=True, remote_ok=True, cap=None):
+    """'unload model' button: own local server + model at api_url -> (any_unloaded, message).
+
+    `local_ok` / `remote_ok` = authorization for the process-control part
+    (stopping the managed local llama-server) / the remote part. On a shared
+    server the route handler passes the profile's allow_local_unload /
+    allow_unload flags; callers without a policy (private, local request)
+    keep the default True.
+    """
     parts, any_done = [], False
-    if _local_served() is not None:
+    if local_ok and _local_served() is not None:
         _stop_local_server()
         parts.append(f"local server (port {LOCAL_PORT}) stopped")
         any_done = True
     if api_url:
-        key, err = _resolve_api_key(api_key_env)
-        if err:
-            parts.append(err)
+        if not remote_ok:
+            parts.append("remote unload not allowed on this server")
         else:
-            names, note = _unload_remote(api_url, backend, key)
-            if names:
-                parts.append("unloaded " + ", ".join(names))
-                any_done = True
-            elif note and not any_done:
-                parts.append(note)
+            key, err = _resolve_api_key(api_key_env)
+            if err:
+                parts.append(err)
+            else:
+                names, note = _unload_remote(api_url, backend, key, cap)
+                if names:
+                    parts.append("unloaded " + ", ".join(names))
+                    any_done = True
+                elif note and not any_done:
+                    parts.append(note)
     return any_done, "; ".join(parts) or "nothing loaded."
 
 
@@ -772,7 +1056,14 @@ class MMLLMMultitool(io.ComfyNode):
                 "surrounding quotes from the reply.\n\n"
                 "VRAM: the 'unload model' button on the node stops the own local server and "
                 "frees the model at api_url (llama.cpp router, Ollama); unload_after does the "
-                "same after each run. Recommended when sharing the GPU with rendering."),
+                "same after each run. Recommended when sharing the GPU with rendering.\n\n"
+                "SHARED SERVER: when ComfyUI is shared (env MM_NODEPACK_SHARED_SERVER or a "
+                "non-loopback --listen), every target must match an operator profile from the "
+                "JSON file in env MM_NODEPACK_LLM_PROFILES (backend + allowed URL + credential "
+                "env-var name + lifecycle permissions + response size limit). Unknown "
+                "combinations are rejected before any credential is read or connection made; "
+                "extra_body may not override reserved fields (model, limits, stream, url/auth "
+                "keys). On a private loopback server all of this stays off."),
             search_aliases=["mm", "metamountain", "mm nodepack", "llm mm", "vision mm", "vlm"],
             inputs=[
                 # MODEL / CONNECTION
@@ -883,14 +1174,37 @@ class MMLLMMultitool(io.ComfyNode):
         timeout_s=120, max_retries=2, extra_body="",
         image=None, text=None,
     ):
-        api_key, key_err = _resolve_api_key(api_key_env)
-        if key_err:
-            return (f"ERROR: {key_err}", "", "none", mode)
-
-        base_url   = _normalize_url(api_url)
+        is_local = bool(local_model and local_model != SERVER_CHOICE)
         if mode == "auto":
             mode = "vision" if image is not None else "text"
         is_vision  = mode == "vision"
+
+        # 0 -- Shared-server policy: bind this run to an operator profile BEFORE
+        #      reading any env credential, discovering, connecting or starting
+        #      a local server (queued nodes have no browser request to check).
+        #      Private server: profile stays None and nothing below is restricted.
+        profile = None
+        if policy_active():
+            if is_local:
+                profile, err = _resolve_local_profile(local_model)
+            else:
+                profile, err = _resolve_remote_profile(api_url, backend, api_key_env)
+            if err:
+                return (f"ERROR: {err}", "", "none", mode)
+        cap = profile["max_response_bytes"] if profile else None
+
+        # Local server runs take no credential (the key is dropped after
+        # _ensure_local_server), so their env variable need not exist.
+        # On a shared server the profile names the credential variable (it
+        # matched the workflow's); private runs read the workflow's own.
+        api_key = ""
+        if not is_local:
+            key_env = profile["api_key_env"] if profile else api_key_env
+            api_key, key_err = _resolve_api_key(key_env)
+            if key_err:
+                return (f"ERROR: {key_err}", "", "none", mode)
+
+        base_url = _normalize_url(api_url)
 
         if text and text.strip():
             if "{text}" in user_prompt:
@@ -901,10 +1215,13 @@ class MMLLMMultitool(io.ComfyNode):
         extra, err = _parse_extra_body(extra_body)
         if err:
             return (f"ERROR: {err}", "", "none", mode)
+        if profile is not None:  # shared server only: private runs keep full extra_body control
+            err = _check_extra_body(extra)
+            if err:
+                return (f"ERROR: {err}", "", "none", mode)
 
         # 1 -- Resolve model
         model_extra = {}
-        is_local = bool(local_model and local_model != SERVER_CHOICE)
         if is_local:
             if is_vision and local_model.endswith(" (text)"):
                 return (f"ERROR: '{local_model}' is text only (no mmproj next to it) -- "
@@ -915,7 +1232,7 @@ class MMLLMMultitool(io.ComfyNode):
                 return (f"ERROR: {err}", "", "none", mode)
             backend, api_key = "llama.cpp", ""
         elif not model_id or model_id.strip().lower() in ("auto", ""):
-            resolved, model_extra, err = _get_active_model(base_url, api_key, backend)
+            resolved, model_extra, err = _get_active_model(base_url, api_key, backend, cap)
             if err:
                 return (f"ERROR: {err}", "", "none", mode)
             model_id = resolved
@@ -1040,21 +1357,25 @@ class MMLLMMultitool(io.ComfyNode):
         endpoint = "/api/chat" if backend == "ollama" else "/v1/chat/completions"
         for attempt in range(max_retries + 1):
             try:
+                # credentialed requests never follow redirects: the key must not
+                # be handed to a hop outside the (profile-approved) base URL
                 r = requests.post(
                     f"{base_url}{endpoint}",
                     json=payload,
                     headers=_build_headers(api_key),
                     timeout=timeout_s,
+                    stream=cap is not None,
+                    allow_redirects=not api_key,
                 )
                 r.raise_for_status()
                 if backend == "ollama":
-                    data     = r.json()
+                    data     = _json_capped(r, cap) if cap is not None else r.json()
                     msg      = data.get("message") or {}
                     content  = msg.get("content") or ""
                     thinking = msg.get("thinking") or ""
                     finish   = data.get("done_reason") or ""
                 else:
-                    choice   = r.json()["choices"][0]
+                    choice   = (_json_capped(r, cap) if cap is not None else r.json())["choices"][0]
                     msg      = choice["message"]
                     content  = msg.get("content") or ""
                     thinking = msg.get("reasoning_content") or msg.get("thinking") or ""
@@ -1070,20 +1391,35 @@ class MMLLMMultitool(io.ComfyNode):
                 if clean_output:
                     content = _clean_response(content)
 
-                # Unload after run
+                # Unload after run. On a shared server each part needs its own
+                # profile permission (allow_local_unload / allow_unload).
                 if unload_after and is_local:
-                    _stop_local_server()       # own server: no router API, just stop it
+                    # the managed server is shared by every queued run: on a shared
+                    # server stopping it needs the profile's allow_local_unload
+                    if profile is not None and not profile["allow_local_unload"]:
+                        print("[MM Nodepack] unload_after skipped: the approved profile does not allow local unload")
+                    else:
+                        _stop_local_server()   # own server: no router API, just stop it
                 elif unload_after and backend == "llama.cpp":
-                    try:
-                        requests.post(
-                            f"{base_url}/models/unload",
-                            json={"model": model_id},
-                            headers=_build_headers(api_key),
-                            timeout=10,
-                        )
-                        print(f"[MM Nodepack] Unloaded model '{model_id}' (unload_after=True)")
-                    except Exception as ue:
-                        print(f"[MM Nodepack] Unload failed (non-fatal): {ue}")
+                    if profile is not None and not profile["allow_unload"]:
+                        print("[MM Nodepack] unload_after skipped: the approved profile does not allow unload")
+                    else:
+                        try:
+                            r = requests.post(
+                                f"{base_url}/models/unload",
+                                json={"model": model_id},
+                                headers=_build_headers(api_key),
+                                timeout=10,
+                                stream=cap is not None,
+                                allow_redirects=not api_key,
+                            )
+                            if cap is not None:
+                                _json_capped(r, cap)
+                            else:
+                                r.close()
+                            print(f"[MM Nodepack] Unloaded model '{model_id}' (unload_after=True)")
+                        except Exception as ue:
+                            print(f"[MM Nodepack] Unload failed (non-fatal): {ue}")
 
                 return (content, thinking, model_label, mode)
 
@@ -1101,6 +1437,13 @@ class MMLLMMultitool(io.ComfyNode):
                 )
 
             except requests.exceptions.HTTPError:
+                # error diagnostics are bounded: a streamed error body must not
+                # bypass the profile's size cap
+                text = _bounded_text(r, 4096) if cap is not None else r.text
+                try:
+                    r.close()    # streamed body never consumed: free the connection
+                except Exception:  # noqa: BLE001
+                    pass
                 code   = r.status_code
                 if code == 503 and attempt < max_retries:    # model still (re)loading
                     wait = 2 ** (attempt + 1)
@@ -1109,16 +1452,16 @@ class MMLLMMultitool(io.ComfyNode):
                     continue
                 detail = {
                     401: "401 Unauthorized -- check your API key.",
-                    400: f"400 Bad request -- {r.text[:400]}",
+                    400: f"400 Bad request -- {text[:400]}",
                     503: "503 -- server is still loading the model, try again.",
-                    422: f"422 Validation error -- {r.text[:400]}",
-                    500: f"500 Server error -- {r.text[:200]}",
+                    422: f"422 Validation error -- {text[:400]}",
+                    500: f"500 Server error -- {text[:200]}",
                 }
-                msg = detail.get(code, f'HTTP {code} -- {r.text[:200]}')
-                if "vision_disabled" in r.text:
+                msg = detail.get(code, f'HTTP {code} -- {text[:200]}')
+                if "vision_disabled" in text:
                     msg = (f"NInfer server at {base_url} has vision disabled -- "
                            "enable the 'ninfer-qwen38-vision' profile (--vision) in Supervisor or switch to 'text' mode.")
-                elif "top_k must be in" in r.text:
+                elif "top_k must be in" in text:
                     msg += f" (NInfer requires top_k in [0, 20]; current value: {top_k}.)"
                 elif is_vision and code in (400, 500):
                     msg += " (Sending an image? The model may have no vision projector / mmproj.)"
@@ -1126,7 +1469,7 @@ class MMLLMMultitool(io.ComfyNode):
 
             except KeyError:
                 return (
-                    f"ERROR: Unexpected response format -- {r.text[:200]}",
+                    f"ERROR: Unexpected response format -- {(_bounded_text(r, 4096) if cap is not None else r.text)[:200]}",
                     "", model_label, mode,
                 )
             except Exception as exc:
@@ -1156,16 +1499,42 @@ def register_routes():
 
         @PromptServer.instance.routes.post("/mm/llm/unload")
         async def _llm_unload(request):
-            # the node's "unload model" button: own local server + the model at api_url
+            # the node's "unload model" button: own local server + the model at api_url.
+            # A malformed body is rejected BEFORE anything is dispatched, and on a
+            # shared server -- or for a non-local request on a private one (same
+            # pattern as the image routes) -- the target must match an operator
+            # profile that grants unload before the local server may be stopped
+            # or the remote URL may be contacted.
+            forced = not is_local_request(request.remote)
             try:
-                body = await request.json()
-            except Exception:
-                body = {}
-            args = {k: str(body.get(k) or "") for k in ("api_url", "backend", "api_key_env")}
-            args["backend"] = args["backend"] or "llama.cpp"
+                body = await request.json(content_type=None)
+            except Exception:  # noqa: BLE001
+                return json_error("unload body must be a JSON object")
+            if not isinstance(body, dict):
+                return json_error("unload body must be a JSON object")
+            api_url = str(body.get("api_url") or "")
+            backend = str(body.get("backend") or "") or "llama.cpp"
+            api_key_env = str(body.get("api_key_env") or "")
+            if policy_active() or forced:
+                profile, err = _resolve_remote_profile(api_url, backend, api_key_env, forced=forced)
+                if err or profile is None:
+                    return json_error(err or "no approved LLM profile for this unload target",
+                                      status=403)
+                local_ok = bool(profile["allow_local_unload"])
+                remote_ok = bool(profile["allow_unload"])
+                cap = profile["max_response_bytes"]
+                if not (local_ok or remote_ok):
+                    return json_error("the approved profile does not permit unload actions",
+                                      status=403)
+            else:
+                local_ok = remote_ok = True
+                cap = None
             try:
                 done, msg = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: _unload_all(**args))
+                    None, lambda: _unload_all(api_url=api_url, backend=backend,
+                                              api_key_env=api_key_env,
+                                              local_ok=local_ok, remote_ok=remote_ok,
+                                              cap=cap))
             except Exception as exc:  # noqa: BLE001
                 return json_error(f"{type(exc).__name__}: {exc}")
             return web.json_response({"ok": True, "unloaded": done, "message": msg})

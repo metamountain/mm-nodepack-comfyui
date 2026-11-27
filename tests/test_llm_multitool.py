@@ -9,6 +9,8 @@ Run:
 The module under test imports comfy_api, so the whole suite is skipped in
 interpreters without ComfyUI's site-packages.
 """
+import asyncio
+import json
 import math
 import os
 import sys
@@ -74,11 +76,32 @@ class FakeTensor:
 
 
 class FakeResp:
-    def __init__(self, data=None, code=200, text=""):
-        self._data, self.status_code, self.text = data, code, text or str(data)
+    def __init__(self, data=None, code=200, text="", body=None):
+        self._data, self.status_code = data, code
+        self.text = text if text else ("" if body is not None else str(data))
+        self._body = body          # raw body bytes (for capped reads); derived from data/json otherwise
+        self.closed = False
+
+    def _raw_body(self):
+        if self._body is not None:
+            return self._body
+        if self._data is not None:
+            return json.dumps(self._data).encode("utf-8")
+        return self.text.encode("utf-8")
 
     def json(self):
+        if self._body is not None:
+            return json.loads(self._body.decode("utf-8"))
         return self._data
+
+    def iter_content(self, chunk_size=None, decode_content=False):
+        body = self._raw_body()
+        size = chunk_size or 65536
+        for i in range(0, len(body), size):
+            yield body[i:i + size]
+
+    def close(self):
+        self.closed = True
 
     @property
     def ok(self):
@@ -329,4 +352,486 @@ def test_inputs_have_no_legacy_fields():
     assert not {"api_key", "_header_system_prompt", "_header_user_prompt"} & names
     assert "beellama" not in llm_multitool.BACKENDS
     assert [i.id for i in schema.inputs][0] == "local_model"
+
+
+# -- shared-server policy: profiles ------------------------------------------
+# Dummy profile + dummy credential + in-memory transport (the net fixture or a
+# hand-rolled recorder) + mocked lifecycle functions: no real process or
+# network is ever touched.
+
+KEY_ENV = "MM_TEST_LLM_KEY"
+KEY_VAL = "dummy-secret-key"
+
+
+def dummy_profile(**over):
+    p = {
+        "id": "dummy-ninfer",
+        "backends": ["llama.cpp"],
+        "urls": ["http://127.0.0.1:8080"],
+        "api_key_env": KEY_ENV,
+        "allow_unload": True,
+        "allow_local_unload": True,
+        "allow_local_model": True,
+        "local_models": ["dummy-local"],
+        "max_response_bytes": 4096,
+    }
+    p.update(over)
+    return p
+
+
+_set_profiles_n = 0
+
+
+def set_profiles(monkeypatch, tmp_path, profiles, shared=True):
+    """Write a dummy profile file, point MM_NODEPACK_LLM_PROFILES at it and
+    (optionally) force the shared-server switch; reset the profile cache.
+    Each call gets its own file name so the mtime-keyed cache can never
+    confuse two generations of the file within one test."""
+    global _set_profiles_n
+    _set_profiles_n += 1
+    f = tmp_path / f"profiles_{_set_profiles_n}.json"
+    f.write_text(json.dumps({"profiles": profiles}), encoding="utf-8")
+    monkeypatch.setenv(llm_multitool._PROFILE_ENV, str(f))
+    if shared:
+        monkeypatch.setenv("MM_NODEPACK_SHARED_SERVER", "1")
+    else:
+        monkeypatch.delenv("MM_NODEPACK_SHARED_SERVER", raising=False)
+    monkeypatch.setattr(llm_multitool, "_profile_cache",
+                        {"path": None, "mtime": None, "profiles": None})
+    return str(f)
+
+
+def _block_transport(monkeypatch):
+    """Transport recorder that fails the test if any request goes out."""
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        raise AssertionError("transport must not be called before authorization")
+
+    monkeypatch.setattr(llm_multitool.requests, "get", boom)
+    monkeypatch.setattr(llm_multitool.requests, "post", boom)
+    return calls
+
+
+# -- node execution (queued): policy active ----------------------------------
+
+@needs_comfy
+def test_policy_approved_discovery_and_generation(net, monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    net["get"]["/v1/models"] = FakeResp({"data": [{"id": "m"}]})
+    net["post"] = FakeResp({"choices": [{"message": {"content": "ok"}}]})
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp", api_key_env=KEY_ENV)
+    assert res == ("ok", "", "m", "text")
+    url, payload = net["posts"][-1]
+    assert url == "http://127.0.0.1:8080/v1/chat/completions"
+    assert payload["model"] == "m"
+
+
+@needs_comfy
+def test_policy_approved_retries_then_succeeds(monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    monkeypatch.setattr(llm_multitool.time, "sleep", lambda s: None)
+    posts = []
+
+    def fake_post(url, json=None, **kw):
+        posts.append((url, json, kw.get("headers")))
+        if len(posts) == 1:
+            return FakeResp({}, code=503)
+        return FakeResp({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(llm_multitool.requests, "post", fake_post)
+    monkeypatch.setattr(llm_multitool.requests, "get",
+                        lambda url, **kw: FakeResp({"data": [{"id": "m"}]}))
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp",
+              api_key_env=KEY_ENV, max_retries=2, on_error="return text")
+    assert res[0] == "ok"
+    assert len(posts) == 2
+    assert posts[0][2].get("Authorization") == f"Bearer {KEY_VAL}"
+
+
+@needs_comfy
+def test_policy_unapproved_url_rejects_before_transport(monkeypatch, tmp_path):
+    calls = _block_transport(monkeypatch)
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    res = run(api_url="http://127.0.0.1:9999", backend="llama.cpp",
+              api_key_env=KEY_ENV, on_error="return text")
+    assert res[0].startswith("ERROR:") and "no approved LLM profile" in res[0]
+    assert "127.0.0.1:9999" in res[0]          # redacted host:port is reported
+    assert KEY_VAL not in res[0]                # ...but never the key value
+    assert calls["n"] == 0
+
+
+@needs_comfy
+def test_policy_unapproved_backend_or_credential_var_rejects(monkeypatch, tmp_path):
+    calls = _block_transport(monkeypatch)
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    res = run(api_url="http://127.0.0.1:8080", backend="openai",
+              api_key_env=KEY_ENV, on_error="return text")
+    assert "no approved LLM profile" in res[0]
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp",
+              api_key_env="SOME_OTHER_KEY", on_error="return text")
+    assert "no approved LLM profile" in res[0]
+    assert calls["n"] == 0
+
+
+@needs_comfy
+def test_policy_shared_server_without_profiles_fails_closed(monkeypatch, tmp_path):
+    calls = _block_transport(monkeypatch)
+    set_profiles(monkeypatch, tmp_path, None)   # shared on, no profile file
+    monkeypatch.setenv(llm_multitool._PROFILE_ENV, "")
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp",
+              api_key_env="", on_error="return text")
+    assert res[0].startswith("ERROR:") and "no LLM profiles configured" in res[0]
+    assert calls["n"] == 0
+
+
+@needs_comfy
+def test_policy_oversized_response_controlled_error(monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])     # cap 4096
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    posts = []
+
+    def fake_post(url, json=None, **kw):
+        posts.append((url, json))
+        return FakeResp(body=b"x" * 100000)
+
+    monkeypatch.setattr(llm_multitool.requests, "post", fake_post)
+    monkeypatch.setattr(llm_multitool.requests, "get",
+                        lambda url, **kw: FakeResp({"data": [{"id": "m"}]}))
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp",
+              api_key_env=KEY_ENV, on_error="return text")
+    assert res[0].startswith("ERROR:") and "exceeds the 4096 byte limit" in res[0]
+    assert len(posts) == 1
+
+
+@needs_comfy
+def test_policy_oversized_error_body_stays_bounded(monkeypatch, tmp_path):
+    """A huge 400 body must not leak into the (bounded) error message."""
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    monkeypatch.setattr(llm_multitool.requests, "post",
+                        lambda url, json=None, **kw: FakeResp(code=400, body=b"Y" * 100000))
+    monkeypatch.setattr(llm_multitool.requests, "get",
+                        lambda url, **kw: FakeResp({"data": [{"id": "m"}]}))
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp",
+              api_key_env=KEY_ENV, on_error="return text")
+    assert res[0].startswith("ERROR: 400 Bad request")
+    assert "Y" * 1000 not in res[0]
+    assert len(res[0]) < 1000
+
+
+@needs_comfy
+def test_policy_redirect_with_credentials_not_followed(monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    posts = []
+
+    def fake_post(url, json=None, **kw):
+        posts.append((url, kw.get("allow_redirects")))
+        return FakeResp({}, code=302, text="moved")
+
+    monkeypatch.setattr(llm_multitool.requests, "post", fake_post)
+    monkeypatch.setattr(llm_multitool.requests, "get",
+                        lambda url, **kw: FakeResp({"data": [{"id": "m"}]}))
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp",
+              api_key_env=KEY_ENV, on_error="return text")
+    assert res[0].startswith("ERROR:")
+    assert len(posts) == 1                 # the 302 hop was never followed
+    assert posts[0][1] is False            # allow_redirects disabled for credentialed calls
+
+
+# -- node execution (queued): local model lifecycle ---------------------------
+
+@needs_comfy
+def test_policy_local_model_approved_starts_mocked_server(net, monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    starts = []
+    monkeypatch.setattr(llm_multitool, "_ensure_local_server",
+                        lambda label: starts.append(label) or (llm_multitool.LOCAL_URL, "alias", None))
+    net["post"] = FakeResp({"choices": [{"message": {"content": "ok"}}]})
+    res = run(local_model="dummy-local", mode="text")
+    assert res[0] == "ok" and starts == ["dummy-local"]
+    assert net["posts"][-1][0] == llm_multitool.LOCAL_URL + "/v1/chat/completions"
+
+
+@needs_comfy
+def test_policy_local_model_denied_leaves_process_mock_untouched(monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile(allow_local_model=False, local_models=None)])
+    starts = []
+    monkeypatch.setattr(llm_multitool, "_ensure_local_server",
+                        lambda label: starts.append(label) or (llm_multitool.LOCAL_URL, "a", None))
+    monkeypatch.setattr(llm_multitool, "_stop_local_server", lambda: starts.append("stop"))
+    _block_transport(monkeypatch)
+    res = run(local_model="dummy-local", mode="text", on_error="return text")
+    assert res[0].startswith("ERROR:") and "not approved" in res[0]
+    assert starts == []
+
+
+@needs_comfy
+def test_policy_local_model_label_not_in_profile_list_rejects(monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path,
+                 [dummy_profile(allow_local_model=True, local_models=["other-model"])])
+    starts = []
+    monkeypatch.setattr(llm_multitool, "_ensure_local_server",
+                        lambda label: starts.append(label) or (llm_multitool.LOCAL_URL, "a", None))
+    _block_transport(monkeypatch)
+    res = run(local_model="dummy-local", mode="text", on_error="return text")
+    assert "not approved" in res[0] and starts == []
+
+
+@needs_comfy
+def test_policy_local_run_needs_no_credential(monkeypatch, tmp_path):
+    """A profile credential variable need not exist for local-model runs:
+    the managed llama-server takes no API key."""
+    set_profiles(monkeypatch, tmp_path, [dummy_profile(local_models=None)])
+    monkeypatch.delenv(KEY_ENV, raising=False)
+    starts = []
+    monkeypatch.setattr(llm_multitool, "_ensure_local_server",
+                        lambda label: starts.append(label) or (llm_multitool.LOCAL_URL, "a", None))
+    monkeypatch.setattr(llm_multitool.requests, "post",
+                        lambda url, json=None, **kw: FakeResp({"choices": [{"message": {"content": "ok"}}]}))
+
+    def no_get(url, **kw):
+        raise AssertionError("a local-model run must not query any remote server")
+
+    monkeypatch.setattr(llm_multitool.requests, "get", no_get)
+    res = run(local_model="dummy-local", mode="text")
+    assert res[0] == "ok" and starts == ["dummy-local"]
+
+
+@needs_comfy
+def test_policy_unload_after_skipped_without_permission(net, monkeypatch, tmp_path):
+    """Generation succeeds; the follow-up /models/unload must never go out."""
+    set_profiles(monkeypatch, tmp_path, [dummy_profile(allow_unload=False, allow_local_unload=False)])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    net["get"]["/v1/models"] = FakeResp({"data": [{"id": "m"}]})
+    net["post"] = FakeResp({"choices": [{"message": {"content": "ok"}}]})
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp",
+              api_key_env=KEY_ENV, unload_after=True)
+    assert res[0] == "ok"
+    assert [u for u, _ in net["posts"] if u.endswith("/models/unload")] == []
+
+
+@needs_comfy
+def test_policy_local_model_options_are_filtered(monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path,
+                 [dummy_profile(allow_local_model=True, local_models=["Model-A"])])
+    monkeypatch.setattr(llm_multitool, "_local_models",
+                       {"Model-A": ("/a.gguf", None), "Chat-B": ("/b.gguf", None)})
+    monkeypatch.setattr(llm_multitool, "_local_scan_t", time.time())
+    opts = llm_multitool._local_model_options()
+    assert opts == [llm_multitool.SERVER_CHOICE, "Model-A"]
+    # fail closed: shared server, no profile file
+    set_profiles(monkeypatch, tmp_path, None)
+    assert llm_multitool._local_model_options() == [llm_multitool.SERVER_CHOICE]
+    # private server: everything stays listed
+    monkeypatch.setenv("MM_NODEPACK_SHARED_SERVER", "0")
+    assert llm_multitool._local_model_options() == [llm_multitool.SERVER_CHOICE, "Model-A", "Chat-B"]
+
+
+# -- extra_body reserved fields (applied on every server) ---------------------
+
+@needs_comfy
+def test_policy_unapproved_error_redacts_credential_url():
+    host = llm_multitool._redacted_host("http://user:pass@127.0.0.1:8080/v1/")
+    assert host == "127.0.0.1:8080"
+    assert "user" not in host and "pass" not in host
+
+
+@needs_comfy
+def test_policy_unload_after_dispatched_with_permission(net, monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    net["post"] = FakeResp({"choices": [{"message": {"content": "ok"}}]})
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp",
+              api_key_env=KEY_ENV, unload_after=True)
+    assert res[0] == "ok"
+    assert ("http://127.0.0.1:8080/models/unload", {"model": "m"}) in net["posts"]
+
+
+def _shared_extra(monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [
+        dummy_profile(),
+        dummy_profile(id="dummy-ollama", backends=["ollama"], urls=["http://127.0.0.1:11434"])])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    return {"api_key_env": KEY_ENV, "on_error": "return text"}
+
+
+@needs_comfy
+def test_extra_body_reserved_model_rejected(net, monkeypatch, tmp_path):
+    k = _shared_extra(monkeypatch, tmp_path)
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp", extra_body='{"model": "hacker"}', **k)
+    assert res[0].startswith("ERROR:") and "model" in res[0] and net["posts"] == []
+
+
+@needs_comfy
+def test_extra_body_stream_and_urlish_and_nested_rejected(net, monkeypatch, tmp_path):
+    k = _shared_extra(monkeypatch, tmp_path)
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp", extra_body='{"stream": true}', **k)
+    assert "stream" in res[0] and net["posts"] == []
+    res = run(api_url="http://127.0.0.1:8080", backend="llama.cpp", extra_body='{"proxy_url": "http://x"}', **k)
+    assert "proxy_url" in res[0] and net["posts"] == []
+    res = run(backend="ollama", api_url="http://127.0.0.1:11434",
+              extra_body='{"options": {"num_predict": 8}}', **k)
+    assert "num_predict" in res[0] and net["posts"] == []
+
+
+@needs_comfy
+def test_extra_body_reserved_fields_allowed_on_private_server(net):
+    # policy inactive: the old behavior is unchanged (no reserved-field gate)
+    net["post"] = FakeResp({"choices": [{"message": {"content": "ok"}}]})
+    res = run(extra_body='{"max_tokens": 64}')
+    assert res[0] == "ok"
+    assert net["posts"][-1][1]["max_tokens"] == 64
+
+
+@needs_comfy
+def test_policy_local_unload_after_needs_permission(net, monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile(allow_local_unload=False)])
+    stopped = []
+    monkeypatch.setattr(llm_multitool, "_stop_local_server", lambda: stopped.append(1))
+    monkeypatch.setattr(llm_multitool, "_ensure_local_server",
+                        lambda label: ("http://127.0.0.1:8081", "dummy-local", None))
+    net["post"] = FakeResp({"choices": [{"message": {"content": "ok"}}]})
+    res = run(local_model="dummy-local", unload_after=True)
+    assert res[0] == "ok" and stopped == []
+
+
+@needs_comfy
+def test_extra_body_supported_extension_still_merges(net):
+    net["post"] = FakeResp({"choices": [{"message": {"content": "ok"}}]})
+    res = run(extra_body='{"cache_prompt": true, "top_k": 20}')
+    assert res[0] == "ok"
+    _, payload = net["posts"][-1]
+    assert payload["cache_prompt"] is True and payload["top_k"] == 20
+
+
+# -- /mm/llm/unload route ------------------------------------------------------
+
+class _FakeUnloadRequest:
+    def __init__(self, remote, body=None, malformed=False):
+        self.remote = remote
+        self._body, self._malformed = body, malformed
+
+    async def json(self, content_type=None):
+        if self._malformed:
+            raise ValueError("malformed JSON body")
+        return self._body
+
+
+class _RouteTable:
+    def __init__(self):
+        self.handlers = {}
+
+    def post(self, path):
+        def deco(fn):
+            self.handlers[path] = fn
+            return fn
+        return deco
+
+
+@pytest.fixture
+def unload_route(monkeypatch):
+    """Register /mm/llm/unload against a stub `server` module and hand the
+    async handler back (aiohttp is part of the ComfyUI interpreter)."""
+    pytest.importorskip("aiohttp")
+    import types
+    ps = types.SimpleNamespace(routes=_RouteTable())
+    mod = types.ModuleType("server")
+    mod.PromptServer = type("PromptServerStub", (), {"instance": ps})
+    monkeypatch.setitem(sys.modules, "server", mod)
+    llm_multitool.register_routes()
+    return ps.routes.handlers["/mm/llm/unload"]
+
+
+def _post_unload(handler, remote, body=None, malformed=False):
+    return asyncio.run(handler(_FakeUnloadRequest(remote, body, malformed)))
+
+
+def _json_of(resp):
+    return json.loads(resp.body)
+
+
+@needs_comfy
+def test_route_unload_malformed_json_is_400_before_dispatch(unload_route, monkeypatch):
+    dispatch = []
+    monkeypatch.setattr(llm_multitool, "_unload_all",
+                        lambda **kw: dispatch.append(kw) or (False, "x"))
+    resp = _post_unload(unload_route, "127.0.0.1", malformed=True)
+    assert resp.status == 400 and not dispatch
+    resp = _post_unload(unload_route, "127.0.0.1", body=["not", "an", "object"])
+    assert resp.status == 400 and not dispatch
+    resp = _post_unload(unload_route, "127.0.0.1", body=None)
+    assert resp.status == 400 and not dispatch
+
+
+@needs_comfy
+def test_route_unload_remote_forced_is_profile_bound(unload_route, monkeypatch, tmp_path):
+    """Non-local request on a PRIVATE server: profile gate still applies."""
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()], shared=False)
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    monkeypatch.setattr(llm_multitool, "_local_served", lambda: None)
+    calls = {"get": 0, "post": 0}
+
+    def fake_get(url, **kw):
+        calls["get"] += 1
+        return FakeResp({"data": [{"id": "m", "status": {"value": "loaded"}}]})
+
+    def fake_post(url, json=None, **kw):
+        calls["post"] += 1
+        return FakeResp({"ok": True})
+
+    monkeypatch.setattr(llm_multitool.requests, "get", fake_get)
+    monkeypatch.setattr(llm_multitool.requests, "post", fake_post)
+    body = {"api_url": "http://127.0.0.1:8080", "backend": "llama.cpp", "api_key_env": KEY_ENV}
+    resp = _post_unload(unload_route, "203.0.113.7", body)
+    assert resp.status == 200 and _json_of(resp)["ok"] is True
+    assert calls["get"] == 1 and calls["post"] == 1
+    # unapproved target: 403, transport untouched
+    calls["get"] = calls["post"] = 0
+    bad = dict(body, api_url="http://127.0.0.1:9999")
+    resp = _post_unload(unload_route, "203.0.113.7", bad)
+    assert resp.status == 403 and calls["get"] == 0 and calls["post"] == 0
+
+
+@needs_comfy
+def test_route_unload_local_stop_needs_profile_permission(unload_route, monkeypatch, tmp_path):
+    set_profiles(monkeypatch, tmp_path, [dummy_profile()])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    monkeypatch.setattr(llm_multitool, "_local_served", lambda: "alias")
+    stops, remotes = [], []
+    monkeypatch.setattr(llm_multitool, "_stop_local_server", lambda: stops.append(1))
+    monkeypatch.setattr(llm_multitool, "_unload_remote",
+                        lambda *a, **k: remotes.append((a, k)) or ([], ""))
+    body = {"api_url": "http://127.0.0.1:8080", "backend": "llama.cpp", "api_key_env": KEY_ENV}
+    resp = _post_unload(unload_route, "127.0.0.1", body)
+    assert resp.status == 200 and stops == [1] and len(remotes) == 1
+    # same target, profile without any unload permission: 403, nothing stopped, no remote call
+    set_profiles(monkeypatch, tmp_path,
+                 [dummy_profile(allow_unload=False, allow_local_unload=False)])
+    stops.clear()
+    remotes.clear()
+    resp = _post_unload(unload_route, "127.0.0.1", body)
+    assert resp.status == 403 and stops == [] and remotes == []
+
+
+@needs_comfy
+def test_route_unload_remote_forbidden_by_profile_only_skips_remote(unload_route, monkeypatch, tmp_path):
+    """allow_local_unload without allow_unload: the own server may be stopped,
+    the remote URL may not be contacted."""
+    set_profiles(monkeypatch, tmp_path, [dummy_profile(allow_unload=False, allow_local_unload=True)])
+    monkeypatch.setenv(KEY_ENV, KEY_VAL)
+    monkeypatch.setattr(llm_multitool, "_local_served", lambda: "alias")
+    monkeypatch.setattr(llm_multitool, "_stop_local_server", lambda: None)
+    calls = _block_transport(monkeypatch)
+    body = {"api_url": "http://127.0.0.1:8080", "backend": "llama.cpp", "api_key_env": KEY_ENV}
+    resp = _post_unload(unload_route, "127.0.0.1", body)
+    assert resp.status == 200
+    assert calls["n"] == 0
 
