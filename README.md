@@ -42,6 +42,18 @@ No extra Python dependencies required. (`LLM Multitool MM` only needs a running 
 
 ---
 
+## Shared server file policy
+
+When ComfyUI is shared (reachable by other machines or used by several people), file access is restricted so that a request — or a queued node — cannot read or write arbitrary files on the ComfyUI computer:
+
+- **Reads** (image load, folder listing, previews, upload-origin lookup) are limited to ComfyUI's `input/` and `output/` folders.
+- **Writes** (save, save-as, auto-save) are limited to the `output/` folder. Files are created exclusively: never overwriting, never taking over a pre-created name or a link/hard link planted on it; a failed save leaves no partial file.
+- Client-facing errors are bounded and never disclose file names outside these folders.
+
+The policy switches on automatically when ComfyUI starts with a non-loopback `--listen` address (`127.0.0.1`, `::1`, `localhost` count as loopback; in a comma-separated list any non-loopback entry switches it on). It can be overridden with the environment variable `MM_NODEPACK_SHARED_SERVER`: `1/true/yes/on` forces the policy on, `0/false/no/off` forces it off (an explicit setting always wins).
+
+On a private (loopback-only) server, every **non-local** request is still restricted in the same way; trusted local requests keep the unrestricted behaviour, including OS-dialog files outside the ComfyUI tree and saves next to the source.
+
 ## Notes
 
 - Pasted images (`Ctrl+V`) have no original folder on disk, so **save** opens the save dialog to ask where to store them.

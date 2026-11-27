@@ -21,16 +21,21 @@ from .common import (
     CATEGORY,
     IMAGE_EXTS,
     _FMT_EXT,
+    AccessDeniedError,
     _clean,
+    _is_within,
+    authorize,
     get_folder_paths,
     is_local_request,
     json_error,
     list_folder_images,
     load_image_file,
+    policy_active,
     png_metadata,
     png_text_chunks,
     preview_view_entry,
     save_tensor,
+    write_roots,
 )
 from .dialog import dialog_available, file_dialog
 from .paths import (
@@ -38,6 +43,7 @@ from .paths import (
     find_origin_files,
     load_last_dir,
     next_target,
+    pick_position,
     resolve_folder_image,
     resolve_save_target,
     resolve_source,
@@ -177,16 +183,18 @@ def source_from_prompt(prompt, loader_id):
 
 
 def _save_batch(images, targets, fmt, quality, prompt, extra_pnginfo) -> list:
-    """Save every image of the batch to its target. Returns the written paths.
-    PNG saves ALWAYS embed the prompt + workflow metadata (like core SaveImage)."""
+    """Save every image of the batch to its target. Returns the written paths
+    (the actually written file when a race moved the save to the next number).
+    PNG saves ALWAYS embed the prompt + workflow metadata (like core SaveImage).
+    On a shared server each file is created exclusively under the output root."""
+    roots = write_roots() if policy_active() else None
     paths = []
     for i, img in enumerate(images):
         target = targets[i]
         pnginfo = None
         if os.path.splitext(target)[1].lower() == ".png" and (prompt is not None or extra_pnginfo is not None):
             pnginfo = png_metadata(prompt, extra_pnginfo)
-        save_tensor(img, target, quality=quality, pnginfo=pnginfo)
-        paths.append(target)
+        paths.append(save_tensor(img, target, quality=quality, pnginfo=pnginfo, roots=roots))
     return paths
 
 
@@ -267,16 +275,25 @@ class MMLoadImage(io.ComfyNode):
             if not f:
                 return "folder is empty – click 'choose folder' or enter a folder path"
             abs_f = os.path.abspath(f)
-            if not os.path.isdir(abs_f):
-                return f"folder not found: {abs_f}"
-            if not list_folder_images(abs_f):
-                return f"no supported images found in folder: {abs_f}"
+            try:  # shared server: access check before any existence check or scan
+                authorize(abs_f, "read")
+                if not os.path.isdir(abs_f):
+                    return f"folder not found: {abs_f}"
+                if not list_folder_images(abs_f):
+                    return f"no supported images found in folder: {abs_f}"
+            except AccessDeniedError:  # shared server: folder outside the approved roots
+                return "folder outside the allowed folders (shared server)"
             return True
         # single mode: 'path' wins over the upload combo
         p = _clean(str(path))
         if p:
-            if not os.path.isfile(os.path.abspath(p)):
-                return (f"path points to a missing file (moved or deleted?): {os.path.abspath(p)} – "
+            abs_p = os.path.abspath(p)
+            try:  # shared server: access check before the existence check (no-op otherwise)
+                authorize(abs_p, "read")
+            except AccessDeniedError:
+                return "path outside the allowed folders (shared server)"
+            if not os.path.isfile(abs_p):
+                return (f"path points to a missing file (moved or deleted?): {abs_p} – "
                         "pick or upload an image (that sets a new path) or clear the path field")
             return True
         if isinstance(image, (list, tuple)):  # wired to an output: resolved at run time
@@ -294,24 +311,39 @@ class MMLoadImage(io.ComfyNode):
 
     @classmethod
     def execute(cls, image="", path="", mode="single", folder="", batch_mode=False, index=1):
+        hidden = getattr(cls, "hidden", None)
+        uid = getattr(hidden, "unique_id", None)
+        prompt = getattr(hidden, "prompt", None)
         if mode == "folder":
-            p, pos, _ = resolve_folder_image(folder, bool(batch_mode), int(index))
+            # exactly ONE listing per run: the selected file, the reported 1-based
+            # index and the linked image list all come from the same sorted list,
+            # so a file appearing between scans can never desynchronize them
+            files = list_folder_images(folder)
+            if not files:
+                raise ValueError(f"no images found in folder: {os.path.abspath(folder)}")
+            pos = pick_position(files, bool(batch_mode), int(index))
+            p = files[pos]
             out_index = pos + 1
         else:
             p = resolve_source(image, path)
             out_index = 1
-        hidden = getattr(cls, "hidden", None)
-        uid = getattr(hidden, "unique_id", None)
-        prompt = getattr(hidden, "prompt", None)
         if uid is not None:
             _LAST_RESOLVED[str(uid)] = p
-        img, mask = load_image_file(p)
+        try:
+            img, mask = load_image_file(p)
+        except OSError as e:
+            # the file disappeared or was replaced after the listing: fail the
+            # node (no inconsistent outputs) with a bounded message
+            raise ValueError(f"could not read the selected image ({type(e).__name__})") from e
         h, w = int(img.shape[1]), int(img.shape[2])
         if mode == "folder" and _output_slot_linked(prompt, uid, 5):
             # always the natural sort order (even in random mode): image_list[index - 1]
-            # must stay the loaded image in every mode
-            files = list_folder_images(folder)
-            image_list = [img if f == p else load_image_file(f)[0] for f in files]
+            # must stay the loaded image in every mode; the selected tensor is reused
+            # (kept lazy when unlinked: only the picked file is decoded)
+            try:
+                image_list = [img if f == p else load_image_file(f)[0] for f in files]
+            except OSError as e:
+                raise ValueError(f"a folder image disappeared during load ({type(e).__name__})") from e
         else:
             image_list = [img]
         info = {"path": [p]}   # size: the frontend prints it under the thumbnail
@@ -404,6 +436,152 @@ NODE_LIST = [MMLoadImage, MMPreviewSave]
 # Routes (pattern: film_nodes.py:90-107 – try/except, no server in unit tests)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Route handlers (pure functions: testable without a server).
+# Each returns (status, payload) with payload = {"ok": ...}. The aiohttp
+# handlers below are thin wrappers: parse the JSON body, decide the route
+# policy (restricted = shared server OR non-local request) and send the reply.
+# ---------------------------------------------------------------------------
+
+def _restricted(request) -> bool:
+    """Route-level policy: enforced for every request when the server is
+    shared, and additionally for every non-local request on a private server
+    (trusted loopback keeps the unrestricted behaviour: local dialog files,
+    paths outside the ComfyUI tree, saves next to the source)."""
+    return policy_active() or not is_local_request(request.remote)
+
+
+def _err_text(e: Exception, restricted: bool, default: str = "invalid request") -> str:
+    """Client-facing error text. Restricted contexts get bounded messages:
+    NoSourceError/AccessDeniedError are bounded by construction, anything else
+    must not leak a path outside the approved roots."""
+    if isinstance(e, (NoSourceError, AccessDeniedError)):
+        return str(e)
+    return str(e) if not restricted else default
+
+
+def handle_target(data: dict, restricted: bool = False):
+    """/mm/image/target: next free save target for the loader's current source.
+    The policy gates run with `forced=restricted`: the source is read-authorized
+    and the target write-authorized before any file probe, origin scan or
+    number pick."""
+    try:
+        p = resolve_source_like(data, forced=restricted)
+        if not os.path.isfile(p):
+            return 404, {"ok": False, "error": "file not found"}
+        target = next_target(p, str(data.get("suffix", "_#")), str(data.get("save_as", "")),
+                             str(data.get("format", "same as source")), forced=restricted)
+        return 200, {"ok": True, "target": target}
+    except Exception as e:  # noqa: BLE001
+        if isinstance(e, (NoSourceError, AccessDeniedError)):
+            return (403 if isinstance(e, AccessDeniedError) else 400), {"ok": False, "error": str(e)}
+        return 400, {"ok": False, "error": _err_text(e, restricted)}
+
+
+def handle_resolve(data: dict, restricted: bool = False):
+    """/mm/image/resolve: picker/upload name -> absolute path. An upload in
+    ComfyUI/input is flagged (payload 'upload'): the origin scan over the output
+    tree is done by the caller (the async wrapper runs it in a thread, tests
+    call find_origin_files directly)."""
+    try:
+        fp = get_folder_paths()
+        p = os.path.abspath(fp.get_annotated_filepath(str(data.get("image", ""))))
+        authorize(p, "read", forced=restricted)
+        if not os.path.isfile(p):
+            return 404, {"ok": False, "error": "file not found"}
+        inp = os.path.abspath(fp.get_input_directory())
+        if os.path.commonpath([inp, p]) == inp:
+            return 200, {"ok": True, "file": p, "upload": True}
+        return 200, {"ok": True, "path": p, "file": p}
+    except Exception as e:  # noqa: BLE001
+        if isinstance(e, AccessDeniedError):
+            return 403, {"ok": False, "error": str(e)}
+        return 400, {"ok": False, "error": _err_text(e, restricted)}
+
+
+def handle_preview(data: dict, restricted: bool = False):
+    """/mm/image/preview: live /view entry of the loader's current file.
+    The source is read-authorized (forced=restricted) before the existence
+    check and the thumbnail/decode work."""
+    try:
+        p = resolve_source_like(data, forced=restricted)
+        if not os.path.isfile(p):
+            return 404, {"ok": False, "error": "file not found"}
+        entry = preview_view_entry(p)
+        if entry is None:
+            return 404, {"ok": False, "error": "file not previewable (outside the allowed folders)" if restricted
+                                else "file not previewable (outside output/input or unreadable)"}
+        return 200, {"ok": True, "view": entry, "path": p}
+    except Exception as e:  # noqa: BLE001
+        if isinstance(e, AccessDeniedError):
+            return 403, {"ok": False, "error": str(e)}
+        return 400, {"ok": False, "error": _err_text(e, restricted)}
+
+
+def handle_save(data: dict, restricted: bool = False):
+    """/mm/image/save: save a preview image next to its source (never overwrites)."""
+    try:
+        t = str(data.get("type", ""))
+        if t not in ("temp", "output"):
+            return 400, {"ok": False, "error": "type must be 'temp' or 'output'"}
+        fp = get_folder_paths()
+        base_dir = fp.get_temp_directory() if t == "temp" else fp.get_output_directory()
+        sub = str(data.get("subfolder", ""))
+        fname = str(data.get("filename", ""))
+        if not fname or os.path.isabs(fname):
+            return 400, {"ok": False, "error": "bad filename"}
+        src_file = os.path.abspath(os.path.join(base_dir, sub, fname))
+        # the preview file must live inside its own folder (real paths: a link
+        # that leaves the folder is rejected, not followed)
+        if not _is_within(src_file, base_dir):
+            return 403, {"ok": False, "error": "file outside the allowed folder"}
+        if not os.path.isfile(src_file):
+            return 404, {"ok": False, "error": "preview file not found"}
+        fmt = str(data.get("format", "same as source"))
+        if fmt != "same as source" and fmt not in _FMT_EXT:
+            return 400, {"ok": False, "error": "bad format"}
+        src = _clean(str(data.get("source", "")))
+        if not src:
+            try:
+                # forced here as well: a folder-mode payload must not scan an
+                # outside folder before the source is policy-checked
+                src = resolve_source_like(data, forced=restricted)
+            except NoSourceError:
+                src = ""
+        if src:
+            # a source the loader does not know is a 404, not a silent fallback;
+            # the payload's source field is authorized before any probe
+            src = os.path.abspath(src)
+            authorize(src, "read", forced=restricted)
+            if not os.path.isfile(src):
+                return 404, {"ok": False, "error": "source not found"}
+            target = next_target(src, str(data.get("suffix", "_#")), str(data.get("save_as", "")), fmt,
+                                 forced=restricted)
+        else:
+            # no loader in the graph (e.g. txt2img preview): save_as as-is
+            # (absolute) or the output dir (preview_#.png) – never overwrites
+            target = resolve_save_target("", str(data.get("suffix", "_#")), str(data.get("save_as", "")), fmt,
+                                         forced=restricted)
+        if os.path.splitext(target)[1].lower() not in IMAGE_EXTS:
+            return 400, {"ok": False, "error": "target extension not allowed"}
+        # same load/save core as the nodes (no divergent PIL path); the preview's PNG
+        # text chunks (prompt/workflow) are carried over for .png targets
+        img, _mask = load_image_file(src_file)
+        pnginfo = None
+        if os.path.splitext(target)[1].lower() == ".png":
+            pnginfo = PngImagePlugin.PngInfo()
+            for k, v in png_text_chunks(src_file).items():
+                pnginfo.add_text(k, v)
+        # restricted writes are created exclusively under the approved output root
+        written = save_tensor(img[0], target, quality=int(data.get("quality", 95)),
+                              pnginfo=pnginfo, roots=write_roots() if restricted else None)
+        return 200, {"ok": True, "path": written}
+    except Exception as e:  # noqa: BLE001
+        if isinstance(e, AccessDeniedError):
+            return 403, {"ok": False, "error": str(e)}
+        return 400, {"ok": False, "error": _err_text(e, restricted)}
+
+
 def register_routes():
     try:
         from aiohttp import web
@@ -412,14 +590,8 @@ def register_routes():
         @PromptServer.instance.routes.post("/mm/image/target")
         async def _target(request):
             data = await request.json()
-            try:
-                p = resolve_source_like(data)
-                if not os.path.isfile(p):
-                    return json_error(f"file not found: {p}", status=404)
-                target = next_target(p, str(data.get("suffix", "_#")), str(data.get("save_as", "")), str(data.get("format", "same as source")))
-                return web.json_response({"ok": True, "target": target})
-            except Exception as e:  # noqa: BLE001
-                return json_error(str(e))
+            status, payload = handle_target(data, _restricted(request))
+            return web.json_response(payload, status=status)
 
         @PromptServer.instance.routes.post("/mm/image/dialog")
         async def _dialog(request):
@@ -458,93 +630,29 @@ def register_routes():
         async def _resolve(request):
             # picker/upload name ("x.png", "sub/x.png [input]") -> absolute path for the loader's path field
             data = await request.json()
-            try:
-                fp = get_folder_paths()
-                p = os.path.abspath(fp.get_annotated_filepath(str(data.get("image", ""))))
-                if not os.path.isfile(p):
-                    return json_error(f"file not found: {p}", status=404)
-                inp = os.path.abspath(fp.get_input_directory())
-                if os.path.commonpath([inp, p]) == inp:
-                    # an upload is only a copy: show where the original lives ("" = pasted, unknown)
-                    o = await asyncio.to_thread(find_origin_files, p, fp.get_output_directory())
-                    return web.json_response({"ok": True, "path": o[0] if len(o) == 1 else "", "file": p,
-                                              "candidates": o if len(o) > 1 else []})
-                return web.json_response({"ok": True, "path": p, "file": p})
-            except Exception as e:  # noqa: BLE001
-                return json_error(str(e))
+            restricted = _restricted(request)
+            status, payload = handle_resolve(data, restricted)
+            if status != 200 or not payload.get("upload"):
+                return web.json_response(payload, status=status)
+            # an upload is a copy: find the original in the output tree.
+            # the scan walks the whole tree: keep the event loop free of disk I/O
+            # (both the upload and the scanned tree are authorized with forced=restricted)
+            o = await asyncio.to_thread(find_origin_files, payload["file"],
+                                        get_folder_paths().get_output_directory(), restricted)
+            return web.json_response({"ok": True, "path": o[0] if len(o) == 1 else "",
+                                      "file": payload["file"], "candidates": o if len(o) > 1 else []})
 
         @PromptServer.instance.routes.post("/mm/image/preview")
         async def _preview(request):
             # live preview of the loader's current file (compare-hold without re-run).
             data = await request.json()
-            try:
-                p = resolve_source_like(data)
-                if not os.path.isfile(p):
-                    return json_error(f"file not found: {p}", status=404)
-                entry = preview_view_entry(p)
-                if entry is None:
-                    return json_error("file not previewable (outside output/input or unreadable)", status=404)
-                return web.json_response({"ok": True, "view": entry, "path": p})
-            except Exception as e:  # noqa: BLE001
-                return json_error(str(e))
+            status, payload = handle_preview(data, _restricted(request))
+            return web.json_response(payload, status=status)
 
         @PromptServer.instance.routes.post("/mm/image/save")
         async def _save(request):
             data = await request.json()
-            try:
-                t = str(data.get("type", ""))
-                if t not in ("temp", "output"):
-                    return json_error("type must be 'temp' or 'output'")
-                fp = get_folder_paths()
-                base_dir = fp.get_temp_directory() if t == "temp" else fp.get_output_directory()
-                sub = str(data.get("subfolder", ""))
-                fname = str(data.get("filename", ""))
-                if not fname or os.path.isabs(fname):
-                    return json_error("bad filename")
-                src_file = os.path.abspath(os.path.join(base_dir, sub, fname))
-                # the preview file must live inside its own folder (no path escape)
-                if os.path.commonpath([os.path.abspath(base_dir), src_file]) != os.path.abspath(base_dir):
-                    return json_error("file outside the allowed folder", status=403)
-                if not os.path.isfile(src_file):
-                    return json_error(f"preview file not found: {src_file}", status=404)
-                fmt = str(data.get("format", "same as source"))
-                if fmt != "same as source" and fmt not in _FMT_EXT:
-                    return json_error(f"bad format: {fmt}")
-                src = _clean(str(data.get("source", "")))
-                if not src:
-                    try:
-                        src = resolve_source_like(data)
-                    except NoSourceError:
-                        src = ""
-                suffix = str(data.get("suffix", "_#"))
-                save_as = str(data.get("save_as", ""))
-                if src:
-                    # a source the loader does not know is a 404, not a silent fallback
-                    src = os.path.abspath(src)
-                    if not os.path.isfile(src):
-                        return json_error(f"source not found: {src}", status=404)
-                    target = next_target(src, suffix, save_as, fmt)
-                else:
-                    # no loader in the graph (e.g. txt2img preview): save_as as-is
-                    # (absolute) or the output dir (preview_#.png) – never overwrites
-                    target = resolve_save_target("", suffix, save_as, fmt)
-                if os.path.splitext(target)[1].lower() not in IMAGE_EXTS:
-                    return json_error(f"target extension not allowed: {os.path.splitext(target)[1]}")
-                out_dir = os.path.abspath(fp.get_output_directory())
-                if not is_local_request(request.remote) and os.path.commonpath([out_dir, os.path.abspath(target)]) != out_dir:
-                    # browser on another computer (--listen): writes only inside the output folder
-                    return json_error("from another computer, saving is limited to the output folder", status=403)
-                # same load/save core as the nodes (no divergent PIL path); the preview's PNG
-                # text chunks (prompt/workflow) are carried over for .png targets
-                img, _mask = load_image_file(src_file)
-                pnginfo = None
-                if os.path.splitext(target)[1].lower() == ".png":
-                    pnginfo = PngImagePlugin.PngInfo()
-                    for k, v in png_text_chunks(src_file).items():
-                        pnginfo.add_text(k, v)
-                save_tensor(img[0], target, quality=int(data.get("quality", 95)), pnginfo=pnginfo)
-                return web.json_response({"ok": True, "path": target})
-            except Exception as e:  # noqa: BLE001
-                return json_error(str(e))
+            status, payload = handle_save(data, _restricted(request))
+            return web.json_response(payload, status=status)
     except Exception as e:  # noqa: BLE001 - without a server (unit tests) no route
         logging.getLogger(__name__).warning("[MM Nodepack] routes not registered (%s): %s", type(e).__name__, e)

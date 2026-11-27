@@ -10,6 +10,7 @@ does not provide it (e.g. a plain venv without ComfyUI's site-packages).
 import json
 import os
 import sys
+import threading
 import types
 
 import pytest
@@ -24,16 +25,23 @@ sys.path.insert(0, REPO_ROOT)
 # sys.path, so make conftest_helpers importable explicitly
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PIL import Image  # noqa: E402
+from PIL import Image, PngImagePlugin  # noqa: E402
 
+from py import common as py_common  # noqa: E402
 from py import paths as py_paths  # noqa: E402
+from py.access_policy import shared_server  # noqa: E402
 from py.common import (  # noqa: E402
     IMAGE_EXTS,
     LRUCache,
+    AccessDeniedError,
+    authorize,
+    create_exclusive,
     list_folder_images,
     load_image_file,
+    open_verified,
     preview_view_entry,
     save_tensor,
+    view_entry,
 )
 from py.paths import (  # noqa: E402
     NoSourceError,
@@ -42,6 +50,7 @@ from py.paths import (  # noqa: E402
     last_dir_file,
     load_last_dir,
     next_target,
+    pick_position,
     resolve_folder_image,
     resolve_save_target,
     resolve_source_like,
@@ -670,6 +679,445 @@ def test_save_tensor_accepts_single_batch_4d_tensor(tmp_path):
     out3 = save_tensor(img[0], str(tmp_path / "out3.png"))
     out4 = save_tensor(img[:1], str(tmp_path / "out4.png"))
     assert os.path.isfile(out3) and os.path.isfile(out4)
+
+
+# ---------------------------------------------------------------------------
+# access_policy: shared-server switch (env override, --listen, missing comfy)
+# ---------------------------------------------------------------------------
+
+def _fake_cli_args(monkeypatch, listen):
+    """Install a fake comfy.cli_args module with a fixed --listen value."""
+    comfy_mod = types.ModuleType("comfy")
+    cli_mod = types.ModuleType("comfy.cli_args")
+    cli_mod.args = types.SimpleNamespace(listen=listen)
+    comfy_mod.cli_args = cli_mod
+    monkeypatch.setitem(sys.modules, "comfy", comfy_mod)
+    monkeypatch.setitem(sys.modules, "comfy.cli_args", cli_mod)
+
+
+def test_access_policy_env_values(monkeypatch):
+    monkeypatch.delenv("MM_NODEPACK_SHARED_SERVER", raising=False)
+    for v in ("1", "true", "yes", "on", "TRUE", "Yes", " ON "):
+        monkeypatch.setenv("MM_NODEPACK_SHARED_SERVER", v)
+        assert shared_server() is True, f"env {v!r} must enable the policy"
+    for v in ("0", "false", "no", "off", "FALSE", "No", " off "):
+        monkeypatch.setenv("MM_NODEPACK_SHARED_SERVER", v)
+        assert shared_server() is False, f"env {v!r} must disable the policy"
+
+
+def test_access_policy_env_overrides_listen(monkeypatch):
+    _fake_cli_args(monkeypatch, "0.0.0.0")  # non-loopback listen
+    monkeypatch.setenv("MM_NODEPACK_SHARED_SERVER", "0")
+    assert shared_server() is False, "an explicit env 'off' wins over a non-loopback listen"
+    _fake_cli_args(monkeypatch, "127.0.0.1")  # loopback listen
+    monkeypatch.setenv("MM_NODEPACK_SHARED_SERVER", "1")
+    assert shared_server() is True, "an explicit env 'on' wins over a loopback listen"
+
+
+def test_access_policy_listen(monkeypatch):
+    monkeypatch.delenv("MM_NODEPACK_SHARED_SERVER", raising=False)
+    _fake_cli_args(monkeypatch, "127.0.0.1")
+    assert shared_server() is False, "loopback listen -> private"
+    _fake_cli_args(monkeypatch, "::1")
+    assert shared_server() is False, "IPv6 loopback -> private"
+    _fake_cli_args(monkeypatch, "localhost")
+    assert shared_server() is False, "localhost -> private"
+    _fake_cli_args(monkeypatch, "0.0.0.0")
+    assert shared_server() is True, "non-loopback listen -> shared"
+    _fake_cli_args(monkeypatch, "127.0.0.1,0.0.0.0")
+    assert shared_server() is True, "any non-loopback entry of the list counts"
+    _fake_cli_args(monkeypatch, "127.0.0.1,::1")
+    assert shared_server() is False, "an all-loopback list stays private"
+
+
+def test_access_policy_missing_comfy(monkeypatch):
+    monkeypatch.delenv("MM_NODEPACK_SHARED_SERVER", raising=False)
+    # a comfy module without the cli_args submodule: the lazy import must fail
+    # back to the private behaviour instead of raising
+    monkeypatch.setitem(sys.modules, "comfy", types.ModuleType("comfy"))
+    assert shared_server() is False, "unreadable ComfyUI runtime -> private"
+    # cli_args present but without a listen attribute (and with an empty one)
+    _fake_cli_args(monkeypatch, "")
+    assert shared_server() is False, "empty --listen stays private"
+
+
+# ---------------------------------------------------------------------------
+# authorize: the policy gate (roots, links, case, bounded errors)
+# ---------------------------------------------------------------------------
+
+def _policy_on(monkeypatch):
+    monkeypatch.setattr(py_common, "policy_active", lambda: True)
+
+
+def test_authorize_read_write_roots(tmp_path, monkeypatch):
+    d = str(tmp_path)
+    inp, outp = os.path.join(d, "input"), os.path.join(d, "output")
+    os.makedirs(os.path.join(inp, "nested", "deep"))
+    os.makedirs(os.path.join(outp, "nested"))
+    _policy_on(monkeypatch)
+    with FolderPathsStub(make_folder_paths_stub(inp, outp, os.path.join(d, "temp"))):
+        authorize(os.path.join(inp, "nested", "deep", "x.png"), "read")   # nested under input
+        authorize(os.path.join(outp, "nested", "y.png"), "read")         # nested under output
+        authorize(os.path.join(outp, "nested", "z.png"), "write")        # write under output
+        with pytest.raises(AccessDeniedError):
+            authorize(os.path.dirname(inp), "read")            # the resolved parent of a root
+        with pytest.raises(AccessDeniedError):
+            authorize(os.path.join(d, "outside.png"), "read")  # outside every read root
+        with pytest.raises(AccessDeniedError):
+            authorize(os.path.join(d, "outside.png"), "write")  # write outside the output root
+
+
+def test_authorize_error_message_never_names_the_path(tmp_path, monkeypatch):
+    d = str(tmp_path)
+    inp, outp = os.path.join(d, "input"), os.path.join(d, "output")
+    os.makedirs(inp)
+    os.makedirs(outp)
+    secret = os.path.join(d, "SECRET_DIR", "top-secret-file.png")
+    _policy_on(monkeypatch)
+    with FolderPathsStub(make_folder_paths_stub(inp, outp, os.path.join(d, "temp"))):
+        try:
+            authorize(secret, "read")
+            pytest.fail("authorize must refuse paths outside the read roots")
+        except AccessDeniedError as e:
+            msg = str(e)
+        assert "SECRET_DIR" not in msg and "top-secret-file" not in msg, f"error message leaks the path: {msg!r}"
+        assert "secret" not in msg.lower(), f"error message leaks the path: {msg!r}"
+        assert msg == "path outside the allowed folders"
+        try:
+            authorize(secret, "write")
+            pytest.fail("authorize must refuse writes outside the output root")
+        except AccessDeniedError as e:
+            assert "secret" not in str(e).lower() and str(e) == "target outside the allowed output folder"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="case-insensitive containment is a Windows property")
+def test_authorize_case_insensitive_paths(tmp_path, monkeypatch):
+    d = str(tmp_path)
+    inp, outp = os.path.join(d, "input"), os.path.join(d, "output")
+    os.makedirs(os.path.join(inp, "dir"))
+    os.makedirs(outp)
+    _policy_on(monkeypatch)
+    with FolderPathsStub(make_folder_paths_stub(inp, outp, os.path.join(d, "temp"))):
+        # a case-different spelling of the same location is the same path on
+        # case-insensitive file systems (a missing write target keeps the caller's case)
+        authorize(os.path.join(inp, "DIR", "FILE.png"), "read")
+        authorize(os.path.join(outp, "NESTED", "Z.png"), "write")
+
+
+def _make_dir_link(path, target):
+    """Create a directory symlink/junction `path` -> `target`; skip the test when
+    the platform/privileges do not allow it."""
+    try:
+        os.symlink(target, path, target_is_directory=True)
+    except OSError:
+        if os.name == "nt":
+            import subprocess
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(path), str(target)],
+                               capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.isdir(path):
+                pytest.skip(f"symlink/junction cannot be created here: {r.stderr.strip()[:120]}")
+        else:
+            pytest.skip("directory symlinks cannot be created here")
+
+
+def test_authorize_symlink_escaping_root_denied(tmp_path, monkeypatch):
+    d = str(tmp_path)
+    inp, outp = os.path.join(d, "input"), os.path.join(d, "output")
+    outside = os.path.join(d, "outside")
+    os.makedirs(os.path.join(inp, "dir"))
+    os.makedirs(outp)
+    os.makedirs(outside)
+    _png(os.path.join(outside, "secret.png"), (2, 2))
+    _png(os.path.join(inp, "x.png"), (2, 2))
+    escape = os.path.join(inp, "dir", "escape")
+    _make_dir_link(escape, outside)   # skips when links are impossible
+    evil = os.path.join(outp, "evil")
+    _make_dir_link(evil, outside)
+    _policy_on(monkeypatch)
+    with FolderPathsStub(make_folder_paths_stub(inp, outp, os.path.join(d, "temp"))):
+        with pytest.raises(AccessDeniedError):
+            authorize(os.path.join(escape, "secret.png"), "read")   # read link leaving the root
+        with pytest.raises(AccessDeniedError):
+            authorize(os.path.join(evil, "secret.png"), "write")    # write link leaving the root
+        # a link that stays inside the root is allowed
+        inner = os.path.join(inp, "inner")
+        _make_dir_link(inner, inp)
+        authorize(os.path.join(inner, "x.png"), "read")
+
+
+# ---------------------------------------------------------------------------
+# route handlers: restricted (non-local) requests are checked before any disk
+# work; trusted local requests keep the unrestricted behaviour
+# ---------------------------------------------------------------------------
+
+class _CallSpy:
+    """Monkeypatch target that records every call: a call fails the test."""
+
+    def __init__(self, name):
+        self.name = name
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        raise AssertionError(f"{self.name} must not be called in a rejected request")
+
+
+def _route_dirs(tmp_path, monkeypatch):
+    """Real ComfyUI-like folders with a PRIVATE server (policy inactive): the
+    restricted=True cases exercise the forced (non-local request) gates."""
+    d = str(tmp_path)
+    inp, outp, temp = os.path.join(d, "input"), os.path.join(d, "output"), os.path.join(d, "temp")
+    os.makedirs(os.path.join(inp, "sub"))
+    os.makedirs(outp)
+    os.makedirs(temp)
+    monkeypatch.setattr(py_common, "policy_active", lambda: False)
+    return d, inp, outp, temp
+
+
+def test_route_restricted_rejected_never_touches_disk(tmp_path, monkeypatch):
+    d, inp, outp, temp = _route_dirs(tmp_path, monkeypatch)
+    outside = _png(os.path.join(d, "outside.png"), (4, 4))
+    outside_dir = os.path.join(d, "outside_dir")
+    os.makedirs(outside_dir)
+    evil = _png(os.path.join(d, "evil.png"), (4, 4))
+    fp = make_folder_paths_stub(inp, outp, temp)
+    fp.get_annotated_filepath = (lambda name: evil if name == "evil.png" else os.path.join(inp, name))
+    # the scanner, the decoder and the writer must never run for a rejected request
+    spy_scandir = _CallSpy("os.scandir")
+    spy_open = _CallSpy("Image.open")
+    spy_save = _CallSpy("save_tensor")
+    monkeypatch.setattr(py_common.os, "scandir", spy_scandir)
+    monkeypatch.setattr(Image, "open", spy_open)
+    monkeypatch.setattr(image_io, "save_tensor", spy_save)
+    with FolderPathsStub(fp):
+        _png(os.path.join(temp, "prev.png"), (4, 4))  # a valid preview file for the save case
+        st, p = image_io.handle_preview({"path": outside}, restricted=True)
+        assert st == 403 and p["ok"] is False, f"restricted preview outside the roots -> 403: {st} {p}"
+        st, p = image_io.handle_preview({"mode": "folder", "folder": outside_dir}, restricted=True)
+        assert st == 403 and p["ok"] is False, f"restricted folder outside the roots -> 403: {st} {p}"
+        st, p = image_io.handle_target({"path": outside}, restricted=True)
+        assert st == 403 and p["ok"] is False, f"restricted target outside the roots -> 403: {st} {p}"
+        st, p = image_io.handle_save({"type": "temp", "filename": "prev.png", "source": outside}, restricted=True)
+        assert st == 403 and p["ok"] is False, f"restricted save from an outside source -> 403: {st} {p}"
+        st, p = image_io.handle_resolve({"image": "evil.png"}, restricted=True)
+        assert st == 403 and p["ok"] is False, f"restricted resolve outside the roots -> 403: {st} {p}"
+        for spy in (spy_scandir, spy_open, spy_save):
+            assert not spy.calls, f"{spy.name} was called in a rejected request: {spy.calls}"
+        # bounded error text: no external path in the reply
+        assert "outside.png" not in str(p)
+
+
+def test_route_restricted_allowed_flows(tmp_path, monkeypatch):
+    d, inp, outp, temp = _route_dirs(tmp_path, monkeypatch)
+    _png(os.path.join(inp, "up.png"), (4, 4), (9, 9, 9))   # remote upload in input
+    _png(os.path.join(temp, "prev.png"), (4, 4), (1, 2, 3))
+    with FolderPathsStub(make_folder_paths_stub(inp, outp, temp)):
+        # remote upload in input -> preview OK (restricted)
+        st, p = image_io.handle_preview({"image": "up.png"}, restricted=True)
+        assert st == 200 and p["ok"] is True
+        assert p["view"] == {"filename": "up.png", "subfolder": "", "type": "input"}
+        # source-less save (restricted) lands under the output root
+        st, p = image_io.handle_save({"type": "temp", "filename": "prev.png", "format": "png"}, restricted=True)
+        assert st == 200 and p["ok"] is True, f"source-less restricted save -> 200: {st} {p}"
+        assert os.path.isfile(p["path"])
+        assert os.path.commonpath([os.path.realpath(outp), os.path.realpath(p["path"])]) == os.path.realpath(outp), \
+            "the restricted save must land inside the output root"
+        # trusted local (loopback) requests keep the unrestricted behaviour:
+        # an arbitrary path outside the ComfyUI tree still works
+        own = _png(os.path.join(d, "own.png"), (4, 4))
+        st, p = image_io.handle_target({"path": own}, restricted=False)
+        assert st == 200 and p["ok"] is True, f"trusted local target next to an outside source -> 200: {st} {p}"
+        assert os.path.dirname(p["target"]) == os.path.abspath(d)
+
+
+# ---------------------------------------------------------------------------
+# view_entry behind a junction/symlinked output root
+# ---------------------------------------------------------------------------
+
+def test_view_entry_symlinked_output_root(tmp_path):
+    d = str(tmp_path)
+    outp = os.path.join(d, "output")
+    os.makedirs(os.path.join(outp, "sub"))
+    _png(os.path.join(outp, "sub", "a.png"), (4, 4))
+    _png(os.path.join(outp, "a2.png"), (4, 4))
+    linked = os.path.join(d, "linked_out")
+    _make_dir_link(linked, outp)   # skips when links are impossible
+    with FolderPathsStub(make_folder_paths_stub(os.path.join(d, "input"), outp, os.path.join(d, "temp"))):
+        e = view_entry(os.path.join(linked, "sub", "a.png"))
+        assert e == {"filename": "a.png", "subfolder": "sub", "type": "output"}, \
+            f"behind a linked output root the subfolder stays inside the tree (no '..'): {e}"
+        e2 = view_entry(os.path.join(linked, "a2.png"))
+        assert e2 == {"filename": "a2.png", "subfolder": "", "type": "output"}, \
+            f"linked root file: {e2}"
+
+
+# ---------------------------------------------------------------------------
+# save_tensor: exclusive create (concurrent saves), metadata, no partial files
+# ---------------------------------------------------------------------------
+
+def test_save_tensor_concurrent_saves_same_target(tmp_path):
+    arr = torch.rand(5, 8, 3)
+    target = str(tmp_path / "race.png")
+    results, errors = [None, None], []
+
+    def worker(i):
+        try:
+            results[i] = save_tensor(arr, target)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors, f"both concurrent saves to the same target must succeed: {errors}"
+    assert results[0] is not None and results[1] is not None
+    assert os.path.abspath(results[0]) != os.path.abspath(results[1]), \
+        "the race loser retries with the next free number -> distinct files"
+    for p in results:
+        assert os.path.isfile(p), "both saves must exist on disk"
+        with Image.open(p) as im:
+            assert im.size == (8, 5), "both files are complete, readable images"
+
+
+def test_save_tensor_png_metadata_roundtrip(tmp_path):
+    arr = torch.rand(5, 8, 3)
+    info = PngImagePlugin.PngInfo()
+    info.add_text("prompt", '{"1": {"class_type": "X"}}')
+    info.add_text("extra", '{"workflow": {}}')
+    p = save_tensor(arr, str(tmp_path / "meta.png"), pnginfo=info)
+    with Image.open(p) as im:
+        assert im.info.get("prompt") == '{"1": {"class_type": "X"}}', "prompt text chunk round-trips"
+        assert im.info.get("extra") == '{"workflow": {}}', "extra text chunks round-trip"
+
+
+def test_save_tensor_failed_save_leaves_no_partial_file(tmp_path, monkeypatch):
+    arr = torch.rand(5, 8, 3)
+    target = str(tmp_path / "fail.png")
+    real_fromarray = Image.fromarray
+
+    def broken_fromarray(a, *args, **kwargs):
+        im = real_fromarray(a, *args, **kwargs)
+
+        def broken_save(*a2, **k2):
+            raise OSError("simulated write failure")
+
+        im.save = broken_save
+        return im
+
+    monkeypatch.setattr(Image, "fromarray", staticmethod(broken_fromarray))
+    with pytest.raises(OSError):
+        save_tensor(arr, target)
+    assert not os.path.exists(target), "a failed save must leave no partial file"
+    assert not [f for f in os.listdir(str(tmp_path)) if f.lower().startswith("fail")], \
+        "no partial or conflict file may remain after a failed save"
+
+
+def test_save_tensor_write_root_guard(tmp_path):
+    arr = torch.rand(5, 8, 3)
+    outp = os.path.join(str(tmp_path), "output")
+    os.makedirs(outp)
+    p = save_tensor(arr, os.path.join(outp, "ok.png"), roots=[outp])   # inside the root: fine
+    assert os.path.isfile(p)
+    with pytest.raises(AccessDeniedError):
+        save_tensor(arr, os.path.join(str(tmp_path), "elsewhere.png"), roots=[outp])
+    assert not os.path.exists(os.path.join(str(tmp_path), "elsewhere.png")), \
+        "the exclusive create refuses a parent outside the write roots (no file)"
+
+
+# ---------------------------------------------------------------------------
+# MMLoadImage.execute folder mode: one listing per run (the snapshot), seeded
+# selection and incremental wraparound, lazy decoding of the image list
+# ---------------------------------------------------------------------------
+
+@needs_comfy
+def test_loader_folder_snapshot_single_listing(tmp_path, monkeypatch):
+    """Exactly ONE listing per run: the picked file, the 1-based index and the
+    (linked) image list all come from the same listing, so a file appearing
+    between scans can never desynchronize them."""
+    batch = os.path.join(str(tmp_path), "batch")
+    os.makedirs(batch)
+    for fname in ("a.png", "b.png", "c.png"):
+        _png(os.path.join(batch, fname), (4, 4))
+    scans = []
+
+    def fake_list(folder, forced=False):
+        scans.append(folder)
+        if len(scans) == 1:
+            # the first listing only sees b and c (a appears only later)
+            return [os.path.join(batch, "b.png"), os.path.join(batch, "c.png")]
+        return [os.path.join(batch, "a.png"), os.path.join(batch, "b.png"), os.path.join(batch, "c.png")]
+
+    monkeypatch.setattr(image_io, "list_folder_images", fake_list)
+    linked = {"5": {"class_type": "MMLoadImage", "inputs": {}},
+              "8": {"class_type": "X", "inputs": {"images": ["5", 5]}}}
+    monkeypatch.setattr(image_io.MMLoadImage, "hidden",
+                        types.SimpleNamespace(unique_id="5", prompt=linked))
+    monkeypatch.setattr(image_io, "_preview_entries", lambda tensors, cls: [])
+    decodes = []
+    real_load = image_io.load_image_file
+
+    def load_spy(p):
+        decodes.append(p)
+        return real_load(p)
+
+    monkeypatch.setattr(image_io, "load_image_file", load_spy)
+    try:
+        out = image_io.MMLoadImage.execute(image="", path="", mode="folder", folder=batch,
+                                           batch_mode=False, index=2)
+        img, _mask, _w, _h, path, image_list, idx = out.args
+        assert len(scans) == 1 and scans[0] == os.path.abspath(batch), \
+            f"folder mode must list exactly once (the snapshot): {len(scans)} scans"
+        # the selection, the index and the list all refer to the FIRST listing [b, c]:
+        # index 2 is the second element of THAT list (c), no matter what a later
+        # listing ([a, b, c]) would say
+        assert path == os.path.join(batch, "c.png"), "selection comes from the first listing (index 2 in [b, c] -> c)"
+        assert idx == 2, "the 1-based index comes from the same listing"
+        assert len(image_list) == 2, "the linked image list is the first listing itself"
+        assert image_list[idx - 1] is img, "the selected tensor is reused at the reported position"
+        other = image_list[0] if idx == 2 else image_list[1]
+        assert other is not img, "the other listed file is a different tensor"
+        assert len(decodes) == 2 and decodes[0] == path, \
+            "the selected file is decoded once, the others are decoded for the list"
+        # the next run takes a fresh listing (a full snapshot again)
+        out2 = image_io.MMLoadImage.execute(image="", path="", mode="folder", folder=batch,
+                                            batch_mode=False, index=1)
+        assert out2.args[4] == os.path.join(batch, "a.png") and out2.args[6] == 1, \
+            "the second run uses its own listing"
+    finally:
+        image_io._LAST_RESOLVED.pop("5", None)
+
+
+@needs_comfy
+def test_loader_folder_seeded_and_wraparound(tmp_path, monkeypatch):
+    batch = os.path.join(str(tmp_path), "batch")
+    os.makedirs(batch)
+    for fname in ("a.png", "b.png", "c.png"):
+        _png(os.path.join(batch, fname), (4, 4))
+    unlinked = {"5": {"class_type": "MMLoadImage", "inputs": {}},
+                "8": {"class_type": "X", "inputs": {"images": ["5", 0]}}}
+    monkeypatch.setattr(image_io.MMLoadImage, "hidden",
+                        types.SimpleNamespace(unique_id="5", prompt=unlinked))
+    monkeypatch.setattr(image_io, "_preview_entries", lambda tensors, cls: [])
+    try:
+        # incremental: an index past the end wraps back to the first image
+        out = image_io.MMLoadImage.execute(image="", path="", mode="folder", folder=batch,
+                                           batch_mode=False, index=7)
+        assert out.args[4] == os.path.join(batch, "a.png") and out.args[6] == 1, \
+            "incremental index past the end wraps to the first image"
+        # random: the seed makes the pick deterministic
+        o1 = image_io.MMLoadImage.execute(image="", path="", mode="folder", folder=batch,
+                                          batch_mode=True, index=42)
+        o2 = image_io.MMLoadImage.execute(image="", path="", mode="folder", folder=batch,
+                                          batch_mode=True, index=42)
+        assert o1.args[4] == o2.args[4], "random: same seed -> same file"
+        assert 1 <= o2.args[6] <= 3, "the reported index is valid for the folder"
+        # unlinked list: only the picked file is decoded
+        assert len(o2.args[5]) == 1 and o2.args[5][0] is o2.args[0], \
+            "unlinked image_list stays the single loaded image"
+    finally:
+        image_io._LAST_RESOLVED.pop("5", None)
 
 
 if __name__ == "__main__":

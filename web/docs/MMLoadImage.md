@@ -34,7 +34,7 @@ A visible **`mode`** selector sits at the top of the node (`single` / `folder`).
 | `width` | `INT` | Image width in pixels. |
 | `height` | `INT` | Image height in pixels. |
 | `path` | `STRING` | Resolved absolute file path on disk. |
-| `image list` | `IMAGE` *(list)* | All images in the folder as a ComfyUI list, **always in natural filename order** (also in `random` mode, so `image list [index]` always reaches the same file as the direct load); every image keeps its own resolution; zero decode overhead when unconnected. |
+| `image list` | `IMAGE` *(list)* | All images in the folder as a ComfyUI list, **always in natural filename order** (also in `random` mode). Zero-based access is `image_list[index - 1]` (the `index` output, 1-based) — it always reaches exactly the same file as the direct load. Every image keeps its own resolution; zero decode overhead when unconnected. |
 | `index` | `INT` | 1-based index of the loaded image in the folder (`1` in single mode). |
 
 ## Wireless Sync

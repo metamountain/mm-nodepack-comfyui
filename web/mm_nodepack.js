@@ -6,6 +6,7 @@ import { api } from "../../scripts/api.js";
 import {
   toast, debounce, viewBlob, loadImage, setWidgetVisible, setWidgetObjVisible, setWidgetDim, fitNodeSize,
 } from "./lib/mm_ui.mjs";
+import { createRefreshChannel } from "./lib/mm_race.mjs";
 
 const SAVE_NODES = new Set(["MMPreviewSave"]);
 const LOADER = "MMLoadImage";
@@ -75,32 +76,45 @@ function loaderLabel(n) {
 // When the loader's file or folder selection changes,
 // refresh the compare slider's "original" (imgA) on every preview node that
 // resolves to this loader — so compare-hold always shows the current source.
-const _refreshCmp = debounce(async (loaderNode) => {
-  const g = loaderNode.graph || app.graph;
-  const body = loaderBody(loaderNode);
-  if (body.mode === "folder" ? !body.folder : (!body.path && !body.image)) return;
-  let j;
-  try {
-    j = await (await api.fetchApi("/mm/image/preview", {
+// Race-safe channel (web/lib/mm_race.mjs): one debounce + revision per loader
+// (editing A and then B within the window refreshes BOTH previews), the
+// revision is re-checked after the fetch (a slower older response never
+// replaces a newer original), and a cleared source shows the empty state even
+// when a fetch is still in flight.
+const compareRefreshChannel = createRefreshChannel({
+  delay: 400,
+  async fetch(loaderNode) {
+    const graph = loaderNode.graph || app.graph;
+    const body = loaderBody(loaderNode);
+    if (body.mode === "folder" ? !body.folder : (!body.path && !body.image)) {
+      return { entry: null, graph };   // cleared source: the write shows the empty state
+    }
+    const j = await (await api.fetchApi("/mm/image/preview", {
       method: "POST",
       body: JSON.stringify(body),
     })).json();
-  } catch { return; }
-  if (!j?.ok || !j.view) return;
-  const aEntry = j.view;
-  for (const n of g._nodes || []) {
-    if (nodeClass(n) !== "MMPreviewSave") continue;
-    const { node: src } = findLoader(n);
-    if (src !== loaderNode) continue;
-    n._rtRefreshTarget?.();  // folder/index/batch_mode changed -> live target tooltip
-    const cmp = n.widgets?.find((w) => w.name === "comparer");
-    if (!cmp) continue;
-    cmp.value.a = [aEntry];
-    cmp.imgA = loadImage(aEntry);
-    cmp.imgA.onload = () => n.setDirtyCanvas?.(true, true);
-    n.setDirtyCanvas?.(true, true);
-  }
-}, 400);
+    if (!j?.ok || !j.view) throw new Error("no preview for the current source");
+    return { entry: j.view, graph };
+  },
+  write(loaderNode, payload) {
+    if (!payload.ok) return;  // fetch failed: keep the current original
+    const { entry, graph } = payload.result;
+    if (!graph || loaderNode.graph !== graph) return;  // the node moved in between
+    for (const n of graph._nodes || []) {
+      if (nodeClass(n) !== "MMPreviewSave") continue;
+      const { node: src } = findLoader(n);
+      if (src !== loaderNode) continue;
+      n._rtRefreshTarget?.();  // folder/index/batch_mode changed -> live target tooltip
+      const cmp = n.widgets?.find((w) => w.name === "comparer");
+      if (!cmp) continue;
+      cmp.value.a = entry ? [entry] : [];
+      cmp.imgA = entry ? loadImage(entry) : null;
+      if (cmp.imgA) cmp.imgA.onload = () => n.setDirtyCanvas?.(true, true);
+      n.setDirtyCanvas?.(true, true);
+    }
+  },
+});
+const _refreshCmp = (loaderNode) => compareRefreshChannel.schedule(loaderNode);
 
 // last pointer position (the button callback has no DOM event to anchor the menu)
 const lastPtr = { clientX: 200, clientY: 200 };
@@ -146,30 +160,35 @@ function addTargetWidget(node) {
     if (node._rtButtons?.[0]) node._rtButtons[0].tooltip = t;
     node.setDirtyCanvas?.(true, true);  // label line shows the live source #id / note
   };
-  node._rtRefreshTarget = debounce(() => {
-    const { node: loader, note } = findLoader(node);
-    node._rtSrcNote = note;
-    node._rtSrcIdLive = loader ? String(loader.id) : "";
-    const body = {
-      ...loaderBody(loader),
-      suffix: node.widgets?.find((x) => x.name === "suffix")?.value ?? "_#",
-      save_as: node.widgets?.find((x) => x.name === "save_as")?.value ?? "",
-      format: node.widgets?.find((x) => x.name === "format")?.value ?? "same as source",
-    };
-    if (body.mode === "folder" ? !body.folder : (!body.path && !body.image)) {
-      // no source: the saver falls back to the output dir, stem "preview"
-      setTarget("output/preview_# (no Load Image MM found)");
-      return;
-    }
-    api.fetchApi("/mm/image/target", { method: "POST", body: JSON.stringify(body) })
-      .then((r) => r.json())
-      .then((j) => {
-        setTarget(j.ok ? j.target : (j.error || "target?"));
-      })
-      .catch((e) => {
-        setTarget(String(e));
-      });
-  }, 300);
+  // race-safe channel per saver (same guarantees as the compare channel): a
+  // cleared source invalidates the in-flight fetch immediately (revision),
+  // and both the empty-source branch and the fetch error handler write only
+  // when their revision is still current.
+  const targetChannel = createRefreshChannel({
+    delay: 300,
+    async fetch() {
+      const { node: loader, note } = findLoader(node);
+      node._rtSrcNote = note;
+      node._rtSrcIdLive = loader ? String(loader.id) : "";
+      const body = {
+        ...loaderBody(loader),
+        suffix: node.widgets?.find((x) => x.name === "suffix")?.value ?? "_#",
+        save_as: node.widgets?.find((x) => x.name === "save_as")?.value ?? "",
+        format: node.widgets?.find((x) => x.name === "format")?.value ?? "same as source",
+      };
+      if (body.mode === "folder" ? !body.folder : (!body.path && !body.image)) {
+        // no source: the saver falls back to the output dir, stem "preview"
+        return { target: "output/preview_# (no Load Image MM found)" };
+      }
+      const j = await (await api.fetchApi("/mm/image/target", { method: "POST", body: JSON.stringify(body) })).json();
+      return { target: j.ok ? j.target : (j.error || "target?") };
+    },
+    write(_key, payload) {
+      if (!payload.ok) setTarget(payload.error);   // fetch error (newest revision only)
+      else setTarget(payload.result.target);       // live target or the empty-source state
+    },
+  });
+  node._rtRefreshTarget = () => targetChannel.schedule(node);
 }
 
 
