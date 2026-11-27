@@ -211,13 +211,13 @@ HELP = {
 #  SAMPLING DEFAULTS
 # =============================================================================
 
-_DEFAULT_TEMP       = 1.0
-_DEFAULT_TOP_P      = 0.95
-_DEFAULT_TOP_K      = 64
+_DEFAULT_TEMP       = 0.7
+_DEFAULT_TOP_P      = 0.9
+_DEFAULT_TOP_K      = 20
 _DEFAULT_MIN_P      = 0.0
-_DEFAULT_REP_PEN    = 1.1
+_DEFAULT_REP_PEN    = 1.05
 _DEFAULT_PRES_PEN   = 0.0
-_DEFAULT_MAX_TOKENS = 2048
+_DEFAULT_MAX_TOKENS = 1024
 
 
 # =============================================================================

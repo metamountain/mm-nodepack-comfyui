@@ -54,7 +54,7 @@ const OPTIONAL_DEFAULTS = {
     multiple_of: 8,
     scale_percent: 200.0,
     scale_factor: 2.0,
-    shortest_side: 1536,
+    shortest_side: 1024,
     longest_side: 2048,
     megapixels: 2.0,
     target_width: 1920,
@@ -67,6 +67,30 @@ const OPTIONAL_DEFAULTS = {
     snap: false,
     crop: false,
 };
+
+// Strict schema bounds: reject shifted legacy values (e.g. old multiple_of=8
+// landing in longest_side) and prevent them from ever poisoning localStorage.
+const NUMERIC_BOUNDS = {
+    multiple_of: [1, 512],
+    scale_percent: [1.0, 800.0],
+    scale_factor: [0.05, 8.0],
+    shortest_side: [64, 16384],
+    longest_side: [64, 16384],
+    megapixels: [0.1, 64.0],
+    target_width: [64, 16384],
+    target_height: [64, 16384],
+    crop_width: [64, 16384],
+    crop_height: [64, 16384],
+    crop_offset_x: [-8192, 8192],
+    crop_offset_y: [-8192, 8192],
+    crop_seed: [0, Number.MAX_SAFE_INTEGER],
+};
+
+function isValidNumeric(name, v) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return false;
+    const b = NUMERIC_BOUNDS[name];
+    return !b || (v >= b[0] && v <= b[1]);
+}
 
 // The combos are repaired against their option lists and NOT against
 // OPTIONAL_DEFAULTS: a combo keeps every valid saved value as-is, while
@@ -109,7 +133,8 @@ const PREVIEW_MAX_H = 150;
 
 // Remember the last chosen target_mode and main sizing parameters for newly
 // created nodes (saved workflows always keep their own stored values).
-const LAST_SETTINGS_KEY = "mm_upscale_crop_last_v1";
+// v2 clears any v1 cache that may have recorded unvalidated legacy values.
+const LAST_SETTINGS_KEY = "mm_upscale_crop_last_v2";
 const REMEMBERED_WIDGETS = [
     "target_mode", "scale_factor", "scale_percent",
     "shortest_side", "longest_side", "megapixels",
@@ -118,6 +143,7 @@ const REMEMBERED_WIDGETS = [
 
 function loadLastSettings() {
     try {
+        window.localStorage?.removeItem("mm_upscale_crop_last_v1");
         const raw = window.localStorage?.getItem(LAST_SETTINGS_KEY);
         if (!raw) return null;
         const parsed = JSON.parse(raw);
@@ -132,7 +158,12 @@ function saveLastSettings(node) {
         const prev = loadLastSettings() || {};
         for (const name of REMEMBERED_WIDGETS) {
             const w = widget(node, name);
-            if (w && w.value !== null && w.value !== undefined) prev[name] = w.value;
+            if (!w || w.value === null || w.value === undefined) continue;
+            if (name === "target_mode") {
+                if (TARGET_MODES.includes(w.value)) prev[name] = w.value;
+            } else if (isValidNumeric(name, w.value)) {
+                prev[name] = w.value;
+            }
         }
         window.localStorage?.setItem(LAST_SETTINGS_KEY, JSON.stringify(prev));
     } catch { /* storage blocked or full */ }
@@ -145,7 +176,7 @@ function applyLastSettings(node) {
         const w = widget(node, name);
         if (!w || saved[name] === undefined || saved[name] === null) continue;
         if (name === "target_mode" && !TARGET_MODES.includes(saved[name])) continue;
-        if (name !== "target_mode" && (typeof saved[name] !== "number" || Number.isNaN(saved[name]))) continue;
+        if (name !== "target_mode" && !isValidNumeric(name, saved[name])) continue;
         w.value = saved[name];
     }
 }
@@ -185,7 +216,7 @@ function repairOptionals(node) {
                 ? fallback : Number(n);
         }
         if (w.value === null || w.value === undefined ||
-            (typeof w.value === "number" && Number.isNaN(w.value))) {
+            (typeof w.value === "number" && !isValidNumeric(name, w.value))) {
             w.value = fallback;
         }
         if (w._mmuGuarded) continue;
@@ -194,7 +225,7 @@ function repairOptionals(node) {
         w.serializeValue = async (...args) => {
             let v = orig ? await orig(...args) : w.value;
             if (v === null || v === undefined ||
-                (typeof v === "number" && Number.isNaN(v))) v = fallback;
+                (typeof v === "number" && !isValidNumeric(name, v))) v = fallback;
             return v;
         };
     }

@@ -301,7 +301,10 @@ def run_playwright_tests(base_url):
         report = page.evaluate("""async () => {
             const app = window.app;
             const LG = window.LiteGraph;
-            localStorage.removeItem('mm_upscale_crop_last_v1');
+            localStorage.removeItem('mm_upscale_crop_last_v2');
+            // Seed poisoned v1/v2 values (e.g. longest_side: 8) -> must be rejected and fall back to 2048
+            localStorage.setItem('mm_upscale_crop_last_v1', JSON.stringify({ longest_side: 8 }));
+            localStorage.setItem('mm_upscale_crop_last_v2', JSON.stringify({ longest_side: 8, shortest_side: 4 }));
 
             const created = {};
             for (const cls of ['MMLoadImage', 'MMPreviewSave', 'MMUpscaleCrop', 'MMLLMMultitool']) {
@@ -358,6 +361,8 @@ def run_playwright_tests(base_url):
                 target_mode: wv(up2, 'target_mode'),
                 target_width: wv(up2, 'target_width'),
                 target_height: wv(up2, 'target_height'),
+                longest_side: wv(up2, 'longest_side'),
+                shortest_side: wv(up2, 'shortest_side'),
             };
 
             // Check DOM widget serialize=false on MMUpscaleCrop
@@ -496,7 +501,10 @@ def run_playwright_tests(base_url):
     ci = ccvis.index("crop_ratio")
     assert ccvis[ci:ci + 3] == ["crop_ratio", "crop_width", "crop_height"], f"crop_width/height not directly under crop_ratio: {ccvis}"
 
-    assert report["remembered"] == {"target_mode": "custom", "target_width": 1344, "target_height": 768}, f"localStorage memory failed: {report['remembered']}"
+    assert report["remembered"] == {
+        "target_mode": "custom", "target_width": 1344, "target_height": 768,
+        "longest_side": 2048, "shortest_side": 1024,
+    }, f"localStorage memory / poisoned-value guard failed: {report['remembered']}"
     assert not report["hasPreviewLeak"], "DOM widget leaked into widgets_values!"
 
     # Verify MMLoadImage has zero duplicate widgets, exact button slots, and clean mode fold-outs

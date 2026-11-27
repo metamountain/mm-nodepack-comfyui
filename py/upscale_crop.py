@@ -662,15 +662,15 @@ class MMUpscaleCrop(io.ComfyNode):
                                tooltip="Used by target_mode scale_factor. The same thing as percent, expressed the other way."),
                 io.Float.Input("scale_percent", default=200.0, min=1.0, max=800.0, step=5.0,
                                tooltip="Used by target_mode scale_percent. 200 doubles, 50 halves."),
-                io.Int.Input("shortest_side", default=1536, min=16, max=16384, step=8,
+                io.Int.Input("shortest_side", default=1024, min=64, max=16384, step=8,
                              tooltip="Used by target_mode shortest_side. Pins min(width, height); the other side follows the aspect ratio."),
-                io.Int.Input("longest_side", default=2048, min=16, max=16384, step=8,
+                io.Int.Input("longest_side", default=2048, min=64, max=16384, step=8,
                              tooltip="Used by target_mode longest_side. Pins max(width, height)."),
-                io.Float.Input("megapixels", default=2.0, min=0.05, max=64.0, step=0.05,
+                io.Float.Input("megapixels", default=2.0, min=0.1, max=64.0, step=0.1,
                                tooltip="Used by target_mode megapixels. Pins the total pixel count; the shape is unchanged."),
-                io.Int.Input("target_width", default=1920, min=16, max=16384, step=8,
+                io.Int.Input("target_width", default=1920, min=64, max=16384, step=8,
                              tooltip="Width of the box. target_mode 'custom' gives you exactly this."),
-                io.Int.Input("target_height", default=1080, min=16, max=16384, step=8,
+                io.Int.Input("target_height", default=1080, min=64, max=16384, step=8,
                              tooltip="Height of the box. target_mode 'custom' gives you exactly this."),
                 io.Combo.Input("resize_condition", options=list(RESIZE_CONDITIONS), default="always",
                                tooltip="Failsafe switch for the absolute target modes (shortest_side, longest_side, megapixels, custom): downscale_only leaves the image untouched when the target is not smaller, upscale_only when it is not larger -- the resize and the upscale model are skipped together and the image leaves the node exactly as it came in. In custom mode a box bigger than the source keeps the source intact instead of upscaling to it. scale_percent and scale_factor are relative and always resize, so the widget is hidden for them. Anything unknown falls back to 'always'."),
@@ -684,11 +684,11 @@ class MMUpscaleCrop(io.ComfyNode):
                              tooltip="Used when snap is on: the result is rounded to a multiple of this. 8 suits SD, SDXL and Flux; 64 for some tiling and video workflows."),
                 io.Boolean.Input("crop", default=False,
                                  tooltip="Off = pure upscaler. On = cut a format out of the result afterwards. Always on for target_mode 'custom', which has to crop to reach the box you typed."),
-                io.Combo.Input("crop_ratio", options=list(RATIO_NAMES), default="4:5",
+                io.Combo.Input("crop_ratio", options=list(RATIO_NAMES), default="16:9",
                                tooltip="The format to cut. Always takes the largest window of that shape that fits. 'custom' uses the crop_width x crop_height box below. Ignored by target_mode 'custom' -- that already cuts to its box, so the size you typed is the size you get."),
-                io.Int.Input("crop_width", default=1024, min=16, max=16384, step=8,
+                io.Int.Input("crop_width", default=1024, min=64, max=16384, step=8,
                              tooltip="Width of the crop window for crop_ratio 'custom'."),
-                io.Int.Input("crop_height", default=1024, min=16, max=16384, step=8,
+                io.Int.Input("crop_height", default=1024, min=64, max=16384, step=8,
                              tooltip="Height of the crop window for crop_ratio 'custom'."),
                 io.Combo.Input("crop_orientation", options=list(ORIENTATIONS), default="auto",
                                tooltip="Which way round the format sits. 'auto' follows the source, so a portrait frame gets a portrait crop and a landscape one gets landscape -- the right choice for a mixed batch. Ignored for 1:1 and for custom."),
@@ -721,11 +721,11 @@ class MMUpscaleCrop(io.ComfyNode):
 
     @classmethod
     def execute(cls, image=None, target_mode="scale_factor", scale_factor=2.0,
-                scale_percent=200.0, shortest_side=1536, longest_side=2048,
+                scale_percent=200.0, shortest_side=1024, longest_side=2048,
                 megapixels=2.0, target_width=1920, target_height=1080,
                 resize_condition="always", method="lanczos",
                 upscale_model=None, snap=False, multiple_of=8,
-                crop=False, crop_ratio="4:5", crop_width=None, crop_height=None,
+                crop=False, crop_ratio="16:9", crop_width=None, crop_height=None,
                 crop_orientation="auto", crop_position="center",
                 crop_offset_x=0, crop_offset_y=0, crop_seed=0):
 
@@ -740,7 +740,7 @@ class MMUpscaleCrop(io.ComfyNode):
         if target_mode is None: target_mode = "scale_factor"
         if scale_factor is None: scale_factor = 2.0
         if scale_percent is None: scale_percent = 200.0
-        if shortest_side is None: shortest_side = 1536
+        if shortest_side is None: shortest_side = 1024
         if longest_side is None: longest_side = 2048
         if megapixels is None: megapixels = 2.0
         if target_width is None: target_width = 1920
@@ -750,7 +750,7 @@ class MMUpscaleCrop(io.ComfyNode):
         if snap is None: snap = False
         if multiple_of is None: multiple_of = 8
         if crop is None: crop = False
-        if crop_ratio is None: crop_ratio = "4:5"
+        if crop_ratio is None: crop_ratio = "16:9"
         if crop_orientation is None: crop_orientation = "auto"
         if crop_position is None: crop_position = "center"
         if crop_offset_x is None: crop_offset_x = 0
@@ -957,7 +957,7 @@ def _preview(data, cached):
         exact_box = box
 
     k = _scale_for(src_w, src_h, mode, num("scale_percent", 200.0),
-                   num("scale_factor", 2.0), num("shortest_side", 1536),
+                   num("scale_factor", 2.0), num("shortest_side", 1024),
                    num("longest_side", 2048), num("megapixels", 2.0),
                    *(box or (0, 0)))
     if exact_box:
@@ -1004,7 +1004,7 @@ def _preview(data, cached):
 
     if bool(data.get("crop")) or exact_box:
         # a box mode always cuts to its box, whatever crop_ratio says
-        ratio = "custom" if exact_box else txt("crop_ratio", "4:5", RATIO_NAMES)
+        ratio = "custom" if exact_box else txt("crop_ratio", "16:9", RATIO_NAMES)
         orient = txt("crop_orientation", "auto", ORIENTATIONS)
         pos = txt("crop_position", "center", CROP_POSITIONS)
         if exact_box:
