@@ -20,6 +20,7 @@ Ask a local or remote LLM for a text answer, or describe and analyse images with
 
 - `model_id` = `auto` uses whatever model the server currently has loaded.
 - Sharing the GPU with rendering? Keep `unload_after` on, or use the **unload model** button between runs.
+- Own local server: the node estimates what the model needs (weights, projector, KV cache for the context), unloads only as many ComfyUI models as that takes, and llama.cpp puts as many layers on the GPU as then fit; the rest run on the CPU. `LLM_MULTITOOL_DEVICE` = `gpu` or `cpu` forces one side (default `auto`).
 - `clean_output` strips think blocks, Markdown and quotes — useful when the reply goes straight into a render prompt.
 - `api_key_env` names an environment variable on the server; the key itself is never stored in the workflow.
 - `extra_body` passes extra JSON options, but reserved fields (model, limits, stream, auth) cannot be overridden.

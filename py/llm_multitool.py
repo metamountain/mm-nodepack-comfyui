@@ -592,6 +592,14 @@ LOCAL_PORT     = int(os.environ.get("LLM_MULTITOOL_PORT", "8081"))
 LOCAL_URL      = f"http://127.0.0.1:{LOCAL_PORT}"
 LOCAL_CTX      = int(os.environ.get("LLM_MULTITOOL_CTX", "16384"))
 LOCAL_LOAD_S   = int(os.environ.get("LLM_MULTITOOL_LOAD_S", "300"))   # max wait for loading
+# Where the own server runs: auto (default) = ComfyUI frees just enough VRAM for the
+# LLM's estimated need and llama.cpp fits as many layers as then fit, the rest on the
+# CPU; gpu = force all layers on the GPU; cpu = CPU only.
+_DEVICES       = ("auto", "gpu", "cpu")
+LOCAL_DEVICE   = os.environ.get("LLM_MULTITOOL_DEVICE", "auto").strip().lower()
+if LOCAL_DEVICE not in _DEVICES:
+    LOCAL_DEVICE = "auto"
+_COMPUTE_MARGIN = 768 * 1024 * 1024   # llama.cpp compute buffers + CUDA context
 # llama.cpp (or a fork such as BeeLlama): env LLAMA_SERVER_BIN, old name BEELLAMA_BIN, then PATH
 LLAMA_SERVER_BIN = (os.environ.get("LLAMA_SERVER_BIN") or os.environ.get("BEELLAMA_BIN")
                     or shutil.which("llama-server") or "")
@@ -913,6 +921,100 @@ def _ensure_local_server(label: str):
     return _wait_ready(proc, alias)
 
 
+def _device_args(device: str) -> list:
+    """llama-server placement flags for LLM_MULTITOOL_DEVICE (unknown values -> auto)."""
+    if device == "cpu":
+        return ["--n-gpu-layers", "0", "--fit", "off"]
+    if device == "gpu":
+        return ["--n-gpu-layers", "99", "--fit", "off"]
+    return ["--fit", "on"]   # llama.cpp sizes the GPU layers to the free VRAM
+
+
+_GGUF_SCALARS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f",
+                 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+
+
+def _gguf_meta(path: str, wanted: tuple) -> dict:
+    """Read the wanted scalar keys (and int arrays, as their max) from a GGUF header."""
+    import struct
+    out = {}
+    with open(path, "rb") as f:
+        def rd(fmt):
+            return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+        def rstr():
+            return f.read(rd("<Q")).decode("utf-8", "replace")
+
+        def value(t):
+            if t in _GGUF_SCALARS:
+                return rd(_GGUF_SCALARS[t])
+            if t == 8:
+                return rstr()
+            if t == 9:
+                et, n = rd("<I"), rd("<Q")
+                if et in _GGUF_SCALARS:
+                    size = struct.calcsize(_GGUF_SCALARS[et])
+                    data = f.read(size * n)
+                    vals = struct.unpack(f"<{n}{_GGUF_SCALARS[et][1]}", data) if n else ()
+                    return max(vals) if vals else 0
+                for _ in range(n):
+                    value(et)
+                return None
+            raise ValueError(f"unknown GGUF type {t}")
+
+        if f.read(4) != b"GGUF":
+            raise ValueError("not a GGUF file")
+        rd("<I"); rd("<Q")
+        for _ in range(rd("<Q")):
+            key, t = rstr(), rd("<I")
+            v = value(t)
+            name = key.split(".", 1)[1] if "." in key else key   # drop the "<arch>." prefix
+            if name in wanted and not key.startswith("general."):
+                out[name] = v
+                if len(out) == len(wanted):
+                    break
+    return out
+
+
+def _llm_vram_need(model_path: str, mmproj_path: str = "", ctx: int = 0) -> int:
+    """Estimated bytes the LLM needs on the GPU: weights + projector + f16 KV cache for
+    ctx tokens + compute margin. The KV size comes from the GGUF header; without it,
+    a conservative 25 % of the weights stands in."""
+    weights = os.path.getsize(model_path)
+    if mmproj_path and os.path.exists(mmproj_path):
+        weights += os.path.getsize(mmproj_path)
+    ctx = ctx or LOCAL_CTX
+    try:
+        m = _gguf_meta(model_path, ("block_count", "attention.head_count_kv", "attention.head_count",
+                                    "attention.key_length", "attention.value_length", "embedding_length"))
+        layers = int(m["block_count"])
+        kv_heads = int(m.get("attention.head_count_kv") or m["attention.head_count"])
+        k_dim = int(m.get("attention.key_length") or m["embedding_length"] // m["attention.head_count"])
+        v_dim = int(m.get("attention.value_length") or k_dim)
+        kv = ctx * layers * kv_heads * (k_dim + v_dim) * 2
+    except Exception:   # unreadable header or an architecture without these keys
+        kv = weights // 4
+    return weights + kv + _COMPUTE_MARGIN
+
+
+def _make_room(need: int) -> tuple:
+    """Free ComfyUI VRAM until `need` bytes are free, unloading only as many of its
+    models as necessary. Returns (free_before, free_after) in bytes, or None without
+    a ComfyUI runtime or GPU."""
+    try:
+        import comfy.model_management as mm
+        dev = mm.get_torch_device()
+        if getattr(dev, "type", "") != "cuda":
+            return None
+        before = mm.get_free_memory(dev)
+        if before < need:
+            mm.free_memory(need, dev)
+            mm.soft_empty_cache()
+        return before, mm.get_free_memory(dev)
+    except Exception:   # no ComfyUI runtime (tests) or an older API
+        return None
+
+
 def _start_local_server(label, paths, alias):
     """Caller holds _local_lock. -> Popen to wait for, or a final result tuple"""
     global _local_proc, _local_label
@@ -935,11 +1037,20 @@ def _start_local_server(label, paths, alias):
         "--alias", alias,
         "--host", "127.0.0.1", "--port", str(LOCAL_PORT),
         "--ctx-size", str(LOCAL_CTX), "--parallel", "1",
-        "--n-gpu-layers", "99", "--fit", "off", "--flash-attn", "on",
+        *_device_args(LOCAL_DEVICE), "--flash-attn", "on",
         "--image-max-tokens", "1024",
         "--sleep-idle-seconds", "300",   # unload after 5 min idle, frees VRAM
     ]
-    print(f"[MM Nodepack] Starting local server: {label} on port {LOCAL_PORT}")
+    if LOCAL_DEVICE != "cpu":
+        need = _llm_vram_need(model_path, mmproj_path or "")
+        room = _make_room(need)
+        if room:
+            gib = 1024 ** 3
+            print(f"[MM Nodepack] Local LLM needs ~{need / gib:.1f} GiB VRAM; free "
+                  f"{room[0] / gib:.1f} -> {room[1] / gib:.1f} GiB"
+                  + (" (llama.cpp keeps the layers that do not fit on the CPU)"
+                     if room[1] < need and LOCAL_DEVICE == "auto" else ""))
+    print(f"[MM Nodepack] Starting local server: {label} on port {LOCAL_PORT} (device {LOCAL_DEVICE})")
     os.makedirs(_STATE_DIR, exist_ok=True)
     with open(_LOG_FILE, "w", encoding="utf-8", errors="replace") as log:
         _local_proc = subprocess.Popen(

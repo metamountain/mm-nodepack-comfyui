@@ -835,3 +835,96 @@ def test_route_unload_remote_forbidden_by_profile_only_skips_remote(unload_route
     assert resp.status == 200
     assert calls["n"] == 0
 
+
+
+@needs_comfy
+def test_device_args_place_layers():
+    assert llm_multitool._device_args("auto") == ["--fit", "on"]
+    assert llm_multitool._device_args("gpu") == ["--n-gpu-layers", "99", "--fit", "off"]
+    assert llm_multitool._device_args("cpu") == ["--n-gpu-layers", "0", "--fit", "off"]
+    assert llm_multitool._device_args("bogus") == ["--fit", "on"]
+    assert llm_multitool.LOCAL_DEVICE in llm_multitool._DEVICES
+
+
+def _write_gguf(path, kv):
+    """Minimal GGUF v3 header: no tensors, the given (key, type, value) pairs."""
+    import struct
+
+    def s(x):
+        b = x.encode()
+        return struct.pack("<Q", len(b)) + b
+
+    out = b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv))
+    for key, t, v in kv:
+        out += s(key) + struct.pack("<I", t)
+        if t == 4:
+            out += struct.pack("<I", v)
+        elif t == 8:
+            out += s(v)
+        elif t == 9:   # array: (elem_type, values)
+            et, vals = v
+            out += struct.pack("<IQ", et, len(vals))
+            for e in vals:
+                out += s(e) if et == 8 else struct.pack("<I", e)
+    path.write_bytes(out + b"\0" * 1000)
+
+
+@needs_comfy
+def test_llm_vram_need_reads_kv_shape(tmp_path):
+    p = tmp_path / "m.gguf"
+    _write_gguf(p, [
+        ("general.architecture", 8, "llama"),
+        ("tokenizer.ggml.tokens", 9, (8, ["a", "b", "c"])),
+        ("llama.block_count", 4, 32),
+        ("llama.attention.head_count", 4, 32),
+        ("llama.attention.head_count_kv", 9, (4, [8, 4, 8])),   # per-layer array -> max
+        ("llama.embedding_length", 4, 4096),
+    ])
+    meta = llm_multitool._gguf_meta(str(p), ("block_count", "attention.head_count_kv"))
+    assert meta == {"block_count": 32, "attention.head_count_kv": 8}
+    need = llm_multitool._llm_vram_need(str(p), "", ctx=16384)
+    kv = 16384 * 32 * 8 * (128 + 128) * 2
+    assert need == p.stat().st_size + kv + llm_multitool._COMPUTE_MARGIN
+
+
+@needs_comfy
+def test_llm_vram_need_falls_back_without_header(tmp_path):
+    p = tmp_path / "broken.gguf"
+    p.write_bytes(b"NOPE" + b"\0" * 4000)
+    proj = tmp_path / "mmproj.gguf"
+    proj.write_bytes(b"\0" * 1000)
+    weights = 4004 + 1000
+    assert llm_multitool._llm_vram_need(str(p), str(proj)) == weights + weights // 4 + llm_multitool._COMPUTE_MARGIN
+
+
+def _fake_mm(monkeypatch, free_seq):
+    import types
+    calls = []
+    seq = list(free_seq)
+    fake = types.SimpleNamespace(
+        get_torch_device=lambda: types.SimpleNamespace(type="cuda"),
+        get_free_memory=lambda dev=None: seq.pop(0),
+        free_memory=lambda need, dev, **kw: calls.append(("free", need)),
+        soft_empty_cache=lambda force=False: calls.append(("empty",)),
+    )
+    pkg = types.ModuleType("comfy")
+    pkg.model_management = fake
+    monkeypatch.setitem(sys.modules, "comfy", pkg)
+    monkeypatch.setitem(sys.modules, "comfy.model_management", fake)
+    return calls
+
+
+@needs_comfy
+def test_make_room_frees_only_when_short(monkeypatch):
+    calls = _fake_mm(monkeypatch, [2 * 2**30, 9 * 2**30])
+    assert llm_multitool._make_room(8 * 2**30) == (2 * 2**30, 9 * 2**30)
+    assert calls == [("free", 8 * 2**30), ("empty",)]
+    calls = _fake_mm(monkeypatch, [12 * 2**30, 12 * 2**30])
+    assert llm_multitool._make_room(8 * 2**30) == (12 * 2**30, 12 * 2**30)
+    assert calls == []   # enough room: ComfyUI keeps its models
+
+
+@needs_comfy
+def test_make_room_without_comfy(monkeypatch):
+    monkeypatch.setitem(sys.modules, "comfy.model_management", None)
+    assert llm_multitool._make_room(1) is None
