@@ -1,6 +1,7 @@
 """OS file dialogs (open/save/folder) on the ComfyUI computer. Windows runs the dialog
 in a child process (a crash there cannot take ComfyUI down), macOS via osascript,
-Linux via zenity/kdialog. The last-used folder is remembered in paths.last_dir_file()."""
+Linux via zenity/kdialog. The last-used folder is remembered per dialog mode in
+paths.last_dir_file()."""
 import json
 import os
 
@@ -23,9 +24,9 @@ def file_dialog(mode: str, start_dir: str, name: str = "") -> str:
     import time
     if mode not in ("open", "save", "folder"):
         mode = "open"
-    # Restore last folder if no explicit start_dir
+    # Restore last folder of this dialog mode if no explicit start_dir
     if not start_dir:
-        start_dir = load_last_dir()
+        start_dir = load_last_dir(mode)
     t0 = time.time()
     env = dict(os.environ, MM_START=start_dir, MM_NAME=name)
     if os.name == "nt":
@@ -34,9 +35,9 @@ def file_dialog(mode: str, start_dir: str, name: str = "") -> str:
         result = _posix_file_dialog(mode, start_dir, name, env)
     elapsed = time.time() - t0
     print(f"[MM Nodepack] file_dialog ({mode}): {elapsed:.2f}s -> {result or 'cancelled'}")
-    # Persist the chosen folder (or parent folder of the chosen file)
+    # Persist the chosen folder (or parent folder of the chosen file) per mode
     if result:
-        save_last_dir(result if mode == "folder" else os.path.dirname(result))
+        save_last_dir(result if mode == "folder" else os.path.dirname(result), mode)
     return result
 
 
@@ -171,9 +172,10 @@ else:
                     ("pvReserved", wintypes.LPVOID), ("dwReserved", wintypes.DWORD),
                     ("FlagsEx", wintypes.DWORD)]
 
-    # a full path in the name field is the only way to beat the dialog's remembered folder
+    # a full path in the name field is the only way to beat the dialog's remembered folder;
+    # an empty name must stay empty (a bare "D:\\dir\\" would fail with FNERR_INVALIDFILENAME)
     first = os.path.basename(name)
-    if start_dir and os.path.isdir(start_dir):
+    if first and start_dir and os.path.isdir(start_dir):
         first = os.path.join(start_dir, first)
     buf = ctypes.create_unicode_buffer(first, 32768)
     ofn = OPENFILENAMEW()

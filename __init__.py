@@ -12,11 +12,6 @@ if "pytest" not in sys.modules:
     from .py.upscale_crop import NODE_LIST as UPSCALE_NODES, register_routes as register_upscale_routes
     from .py.llm_multitool import NODE_LIST as LLM_NODES, register_routes as register_llm_routes
 
-    try:   # optional machine-local nodes (git-ignored file)
-        from .mm_local import NODE_LIST as LOCAL_NODES
-    except ImportError:
-        LOCAL_NODES = []
-
     register_routes()
     register_upscale_routes()
     register_llm_routes()
@@ -24,7 +19,7 @@ if "pytest" not in sys.modules:
 
     class MMNodepackExtension(ComfyExtension):
         async def get_node_list(self):
-            return NODE_LIST + UPSCALE_NODES + LLM_NODES + LOCAL_NODES
+            return NODE_LIST + UPSCALE_NODES + LLM_NODES
 
 
     async def comfy_entrypoint():

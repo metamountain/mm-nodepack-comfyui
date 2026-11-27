@@ -1,12 +1,12 @@
-"""Unit tests for the Upscale Crop MM node (port of the 1.1.0 reference suite).
+"""Unit tests for the Upscale Crop MM node (image-only V3 node).
 
 Run:
   $env:CUDA_VISIBLE_DEVICES='-1'; D:\\ComfyUI_windows_portable\\python_embeded\\python.exe -B -m pytest -p no:cacheprovider tests/ -q
 
 The node's logic is pure tensor maths, so the tests drive execute() directly
-with synthetic images and latents. No ComfyUI server and no real upscale
-model are needed: the model path is exercised with a fake model that records
-what it is handed, and the two-slot model cache is tested on its own.
+with synthetic images. No ComfyUI server and no real upscale model are
+needed: the model path is exercised with a fake model that records what it
+is handed, and the two-slot model cache is tested on its own.
 
 Tests that depend on the V3 node API (comfy_api) are skipped when the
 interpreter does not provide it (e.g. a plain venv without ComfyUI's
@@ -67,8 +67,15 @@ def image(w, h, b=1):
     return (base + torch.rand(b, h, w, 3) * 0.1).clamp(0, 1)
 
 
-def latent(w, h, b=1, c=4):
-    return {"samples": torch.randn(b, c, h, w)}
+def gradient(w, h, b=1):
+    """A B,H,W,C image whose channels encode position: R rises left to
+    right, G rises top to bottom. The mean colour of any cut-out window
+    identifies where that window sat, so anchor direction is checkable."""
+    xs = torch.linspace(0.0, 1.0, w).view(1, 1, w, 1).expand(1, h, w, 1)
+    ys = torch.linspace(0.0, 1.0, h).view(1, h, 1, 1).expand(1, h, w, 1)
+    zz = torch.zeros(1, h, w, 1)
+    base = torch.cat([xs, ys, zz], dim=-1)
+    return base.repeat(b, 1, 1, 1).contiguous()
 
 
 def rgba(w, h, b=1, alpha=0.5):
@@ -165,13 +172,13 @@ def test_schema_id_name_category_and_aliases():
 def test_schema_input_and_output_contracts():
     schema = Node.define_schema()
     assert [i.id for i in schema.inputs] == [
-        "target_mode", "scale_factor", "method", "snap", "multiple_of",
-        "image", "samples", "upscale_model", "scale_percent", "shortest_side",
+        "image", "target_mode", "scale_factor", "scale_percent", "shortest_side",
         "longest_side", "megapixels", "target_width", "target_height",
-        "crop", "crop_ratio", "crop_orientation", "crop_position",
-        "crop_offset_x", "crop_offset_y", "crop_seed", "resize_condition"]
-    assert [o.id for o in schema.outputs] == ["image", "latent", "width",
-                                              "height", "info"]
+        "resize_condition", "method", "upscale_model", "snap", "multiple_of",
+        "crop", "crop_ratio", "crop_width", "crop_height", "crop_orientation",
+        "crop_position", "crop_offset_x", "crop_offset_y", "crop_seed"]
+    assert [o.id for o in schema.outputs] == ["image", "width", "height",
+                                              "info"]
 
 
 # ---------------------------------------------------------------- sizing
@@ -179,12 +186,47 @@ def test_schema_input_and_output_contracts():
 # The size maths, pinned. Source is 1024x1536 throughout -- a portrait
 # render, which is the case the previews and defaults were designed against.
 
+def _snap_out(n, m):
+    """The same snap the node applies to output sizes (mirror of
+    upscale_crop._snap): round to the nearest multiple, never below one."""
+    n = max(1.0, float(n))
+    if m < 1.0:
+        return max(1, int(round(n)))
+    m = max(1, int(round(m)))
+    return max(m, int(round(n / m)) * m)
+
+
+def expected_size(sw, sh, mode, snap, mult, **vals):
+    """The (w, h) execute() must produce, straight from the spec --
+    independent of the node's own helpers, so it cannot drift with them."""
+    if mode == "scale_percent":
+        k = max(0.01, vals["scale_percent"] / 100.0)
+    elif mode == "scale_factor":
+        k = max(0.01, vals["scale_factor"])
+    elif mode == "shortest_side":
+        k = vals["shortest_side"] / max(1, min(sw, sh))
+    elif mode == "longest_side":
+        k = vals["longest_side"] / max(1, max(sw, sh))
+    elif mode == "megapixels":
+        k = (vals["megapixels"] * 1e6 / max(1, sw * sh)) ** 0.5
+    elif mode == "custom":
+        # the crop is not optional in a box mode: cover the (snapped) box,
+        # then cut to it -- the final size IS the box, whatever the source
+        bw, bh = vals["target_width"], vals["target_height"]
+        if snap and mult >= 1:
+            bw, bh = _snap_out(bw, mult), _snap_out(bh, mult)
+        return bw, bh
+    else:
+        raise ValueError(mode)
+    return _snap_out(sw * k, mult if snap else 0.0), _snap_out(sh * k, mult if snap else 0.0)
+
+
 @needs_comfy
 def _out(**kw):
     kw.setdefault("image", image(SRC_W, SRC_H))
     kw.setdefault("method", "lanczos")     # never touch a model in tests
     r = run(**kw)
-    return int(r[0].shape[2]), int(r[0].shape[1]), r[4]
+    return int(r[0].shape[2]), int(r[0].shape[1]), r[3]
 
 
 @needs_comfy
@@ -253,10 +295,109 @@ def test_multiple_of_off_gives_the_exact_number():
     w, h, _ = _out(target_mode="shortest_side", shortest_side=999, multiple_of=1)
     assert min(w, h) == 999, (w, h)
 
+# ---------------------------------------------------------------- matrix
+#
+# The exhaustive sweep: every shape family of source (square, landscape,
+# portrait, ultrawide, tiny) times every target mode and a spread of values,
+# with snap off and on (8 and 64). The expected size is computed from the
+# spec, not from the node's helpers.
+
+RESOLUTIONS = [
+    (512, 512), (1024, 1024),            # square
+    (1920, 1080), (3840, 2160), (777, 533),   # landscape
+    (1080, 1920), (512, 768), (533, 777),     # portrait
+    (2560, 1080),                        # ultrawide
+    (64, 96),                            # tiny
+]
+
+MODE_VALUES = [
+    ("scale_percent", dict(scale_percent=v)) for v in (50.0, 150.0, 200.0)
+]
+MODE_VALUES += [
+    ("scale_factor", dict(scale_factor=v)) for v in (0.5, 1.5, 2.0)
+]
+MODE_VALUES += [
+    ("shortest_side", dict(shortest_side=v)) for v in (512, 1536)
+]
+MODE_VALUES += [
+    ("longest_side", dict(longest_side=v)) for v in (512, 2048)
+]
+MODE_VALUES += [
+    ("megapixels", dict(megapixels=v)) for v in (0.5, 2.0)
+]
+MODE_VALUES += [
+    ("custom", dict(target_width=w, target_height=h))
+    for w, h in [(1920, 1080), (1080, 1920), (1024, 1024), (512, 768), (768, 512)]
+]
+SNAP_CASES = [(False, 1), (True, 8), (True, 64)]
+
+
+@needs_comfy
+@pytest.mark.parametrize("sw, sh", RESOLUTIONS)
+@pytest.mark.parametrize("mode, kws", MODE_VALUES)
+@pytest.mark.parametrize("snap, mult", SNAP_CASES)
+def test_matrix_output_size_is_exact(sw, sh, mode, kws, snap, mult):
+    kw = dict(kws, target_mode=mode, snap=snap, multiple_of=mult, crop=False)
+    # nearest exercises the exact same sizing/snap/crop geometry as lanczos at 30x speed
+    r = run(image=image(sw, sh), method="nearest", **kw)
+    w, h = int(r[0].shape[2]), int(r[0].shape[1])
+    assert r[0].shape == (1, h, w, 3), r[0].shape
+    vals = {k: v for k, v in kw.items()
+            if k not in ("target_mode", "snap", "multiple_of", "crop")}
+    want = expected_size(sw, sh, mode, snap, mult, **vals)
+    assert (w, h) == want, (sw, sh, mode, kws, snap, mult, w, h, want)
+    if snap and mult >= 1:
+        assert w % mult == 0 and h % mult == 0, (sw, sh, mode, mult, w, h)
+
+
+@needs_comfy
+@pytest.mark.parametrize("sw, sh", RESOLUTIONS)
+@pytest.mark.parametrize("snap, mult", [(False, 1), (True, 8), (True, 64)])
+@pytest.mark.parametrize("ratio", ["1:1", "4:5", "16:9"])
+def test_matrix_crop_keeps_size_and_multiples(sw, sh, snap, mult, ratio):
+    r = run(image=image(sw, sh), method="lanczos",
+            target_mode="scale_factor", scale_factor=2.0,
+            crop=True, crop_ratio=ratio, crop_orientation="auto",
+            snap=snap, multiple_of=mult)
+    w, h = int(r[0].shape[2]), int(r[0].shape[1])
+    # the snap can push the upscaled frame itself past 2x (2160 -> 2176 at
+    # mult 64), so the frame -- not the source -- is the upper bound
+    fw = _snap_out(2 * sw, mult if (snap and mult >= 1) else 0.0)
+    fh = _snap_out(2 * sh, mult if (snap and mult >= 1) else 0.0)
+    assert 0 < w <= fw and 0 < h <= fh, (sw, sh, ratio, snap, w, h, fw, fh)
+    if snap and mult >= 1:
+        if w >= mult:
+            assert w % mult == 0, (sw, sh, ratio, mult, w, h)
+        if h >= mult:
+            assert h % mult == 0, (sw, sh, ratio, mult, w, h)
+
+
+@needs_comfy
+@pytest.mark.parametrize("sw, sh", [(512, 512), (1920, 1080), (1080, 1920),
+                                    (2560, 1080), (64, 96)])
+@pytest.mark.parametrize("snap, mult", [(False, 1), (True, 8), (True, 64)])
+def test_matrix_custom_crop_box_is_cut_out_of_the_result(sw, sh, snap, mult):
+    # a dedicated crop box smaller than the upscaled result on every shape
+    cw, ch = min(2 * sw, 1024), min(2 * sh, 768)
+    r = run(image=image(sw, sh), method="lanczos",
+            target_mode="scale_factor", scale_factor=2.0,
+            crop=True, crop_ratio="custom", crop_width=cw, crop_height=ch,
+            crop_orientation="auto", snap=snap, multiple_of=mult)
+    w, h = int(r[0].shape[2]), int(r[0].shape[1])
+    fw = _snap_out(2 * sw, mult if (snap and mult >= 1) else 0.0)
+    fh = _snap_out(2 * sh, mult if (snap and mult >= 1) else 0.0)
+    assert w <= fw and h <= fh, (sw, sh, snap, w, h, fw, fh)
+    if snap and mult >= 1:
+        if w >= mult:
+            assert w % mult == 0, (sw, sh, mult, w, h)
+        if h >= mult:
+            assert h % mult == 0, (sw, sh, mult, w, h)
+
+
 # ---------------------------------------------------------------- crop
 #
-# The crop stage: formats, anchors, offset clamping, and the promise that
-# an image and a latent come out framed identically.
+# The crop stage: formats, anchors, offset clamping. The crop window is a
+# dedicated pair, crop_width x crop_height, for crop_ratio 'custom'.
 
 @needs_comfy
 def _crop(**kw):
@@ -266,7 +407,7 @@ def _crop(**kw):
     kw.setdefault("scale_factor", 2.0)
     kw.setdefault("crop", True)
     r = run(**kw)
-    return int(r[0].shape[2]), int(r[0].shape[1]), r[4]
+    return int(r[0].shape[2]), int(r[0].shape[1]), r[3]
 
 
 @needs_comfy
@@ -274,7 +415,7 @@ def test_crop_off_leaves_the_upscale_alone():
     r = run(image=image(SRC_W, SRC_H), method="lanczos",
             target_mode="scale_factor", scale_factor=2.0, crop=False)
     assert (int(r[0].shape[2]), int(r[0].shape[1])) == (2048, 3072)
-    assert "crop off" in r[4]
+    assert "crop off" in r[3]
 
 
 @needs_comfy
@@ -309,7 +450,7 @@ def test_every_format_fits_inside_and_keeps_its_shape():
 
 @needs_comfy
 def test_custom_uses_the_given_pixels():
-    w, h, _ = _crop(crop_ratio="custom", target_width=1200, target_height=900,
+    w, h, _ = _crop(crop_ratio="custom", crop_width=1200, crop_height=900,
                     multiple_of=1)
     assert (w, h) == (1200, 900), (w, h)
 
@@ -317,14 +458,24 @@ def test_custom_uses_the_given_pixels():
 @needs_comfy
 def test_custom_pixels_still_obey_multiple_of():
     """900 is not a multiple of 8, so it must come back snapped, not exact."""
-    w, h, _ = _crop(crop_ratio="custom", target_width=1200, target_height=900,
+    w, h, _ = _crop(crop_ratio="custom", crop_width=1200, crop_height=900,
                     multiple_of=8, snap=True)
     assert (w, h) == (1200, 896), (w, h)
 
 
 @needs_comfy
+def test_custom_missing_box_falls_back_to_the_target_box():
+    """crop_ratio 'custom' without crop_width/crop_height takes the target
+    box instead of guessing -- the UI shows the dedicated fields, but a
+    workflow can still omit them."""
+    w, h, _ = _crop(crop_ratio="custom", target_width=1200, target_height=900,
+                    crop_width=None, crop_height=None, multiple_of=1)
+    assert (w, h) == (1200, 900), (w, h)
+
+
+@needs_comfy
 def test_custom_larger_than_the_image_is_clamped():
-    w, h, _ = _crop(crop_ratio="custom", target_width=9000, target_height=9000)
+    w, h, _ = _crop(crop_ratio="custom", crop_width=9000, crop_height=9000)
     assert w <= 2048 and h <= 3072, (w, h)
 
 
@@ -358,17 +509,6 @@ def test_crop_output_respects_multiple_of():
         assert w % int(m) == 0 and h % int(m) == 0, (m, w, h)
 
 
-@needs_comfy
-def test_image_and_latent_are_framed_the_same():
-    """The whole reason the crop is computed in normalised coordinates."""
-    r = run(image=image(SRC_W, SRC_H), samples=latent(128, 192),
-            method="lanczos", target_mode="scale_factor", scale_factor=2.0,
-            crop=True, crop_ratio="16:9", crop_orientation="landscape",
-            multiple_of=1)
-    iw, ih = int(r[0].shape[2]), int(r[0].shape[1])
-    lw, lh = int(r[1]["samples"].shape[3]), int(r[1]["samples"].shape[2])
-    assert abs(iw / ih - lw / lh) < 0.05, (iw, ih, lw, lh)
-
 # ---------------------------------------------------------------- exact box
 #
 # target_mode = custom, the box mode, and the crop controls around it.
@@ -382,7 +522,7 @@ def _box(w, h, src=(1024, 1536), **kw):
     kw.setdefault("method", "lanczos")
     r = run(image=image(*src), target_mode="custom",
             target_width=w, target_height=h, **kw)
-    return int(r[0].shape[2]), int(r[0].shape[1]), r[4]
+    return int(r[0].shape[2]), int(r[0].shape[1]), r[3]
 
 
 @needs_comfy
@@ -464,32 +604,10 @@ def test_it_is_not_the_same_as_custom_crop():
 
     r = run(image=image(1024, 1536), method="lanczos",
             target_mode="scale_factor", scale_factor=1.0, crop=True,
-            crop_ratio="custom", target_width=3000, target_height=3000,
+            crop_ratio="custom", crop_width=3000, crop_height=3000,
             multiple_of=1)
     got = (int(r[0].shape[2]), int(r[0].shape[1]))
     assert got == (1024, 1024), got           # the biggest square that fits
-
-
-@needs_comfy
-def test_latent_lands_on_the_box_in_latent_cells():
-    """The box is given in image pixels, so the latent has to divide it by 8
-    -- otherwise it would overshoot eightfold."""
-    r = run(samples=latent(128, 192), method="bicubic",
-            target_mode="custom", target_width=1920, target_height=1080,
-            multiple_of=1)
-    lw, lh = int(r[1]["samples"].shape[3]), int(r[1]["samples"].shape[2])
-    assert (lw, lh) == (240, 135), (lw, lh)
-
-
-@needs_comfy
-def test_image_and_latent_agree_on_the_box():
-    r = run(image=image(SRC_W, SRC_H), samples=latent(128, 192),
-            method="lanczos", target_mode="custom",
-            target_width=1920, target_height=1080, multiple_of=1)
-    iw, ih = int(r[0].shape[2]), int(r[0].shape[1])
-    lw, lh = int(r[1]["samples"].shape[3]), int(r[1]["samples"].shape[2])
-    assert (iw, ih) == (1920, 1080), (iw, ih)
-    assert abs(iw / ih - lw / lh) < 0.05, (iw, ih, lw, lh)
 
 # ---- the two crop controls that changed ----------------------------------
 
@@ -525,6 +643,20 @@ def test_auto_orientation_follows_the_source():
     tall_ar = ((tall[2] - tall[0]) * 1000) / ((tall[3] - tall[1]) * 1500)
     wide_ar = ((wide[2] - wide[0]) * 1500) / ((wide[3] - wide[1]) * 1000)
     assert tall_ar < 1 < wide_ar, (tall_ar, wide_ar)
+
+
+@needs_comfy
+def test_auto_keeps_the_natural_orientation_on_a_square():
+    """A square source has no 'other way round' to follow: 4:5 stays portrait
+    and 16:9 stays landscape, so a square frame in a mixed batch does not
+    flip half the formats."""
+    r = upscale_crop._crop_rect(1024, 1024, "4:5", "auto", 0, 0, "center", 0, 0)
+    ar = ((r[2] - r[0]) * 1024) / ((r[3] - r[1]) * 1024)
+    assert ar < 1, ("4:5 on a square must stay portrait", ar)
+
+    r = upscale_crop._crop_rect(1024, 1024, "16:9", "auto", 0, 0, "center", 0, 0)
+    ar = ((r[2] - r[0]) * 1024) / ((r[3] - r[1]) * 1024)
+    assert ar > 1, ("16:9 on a square must stay landscape", ar)
 
 
 @needs_comfy
@@ -624,17 +756,6 @@ def test_random_keeps_the_size_it_was_asked_for():
 
 
 @needs_comfy
-def test_random_frames_image_and_latent_alike():
-    r = run(image=image(1024, 1536), samples=latent(128, 192),
-            method="lanczos", target_mode="scale_factor", scale_factor=2.0,
-            crop=True, crop_ratio="1:1", crop_position="random", crop_seed=7,
-            multiple_of=1)
-    iw, ih = int(r[0].shape[2]), int(r[0].shape[1])
-    lw, lh = int(r[1]["samples"].shape[3]), int(r[1]["samples"].shape[2])
-    assert abs(iw / ih - lw / lh) < 0.05, (iw, ih, lw, lh)
-
-
-@needs_comfy
 def test_a_custom_box_too_big_keeps_its_shape():
     """It shrinks proportionally to the largest window that fits, the way the
     named formats do -- clamping each axis on its own would hand back some
@@ -643,7 +764,7 @@ def test_a_custom_box_too_big_keeps_its_shape():
                             (1000, 4000, 0.25)]:
         r = run(image=image(1024, 1536), method="lanczos",
                 target_mode="scale_factor", scale_factor=2.0, crop=True,
-                crop_ratio="custom", target_width=cw, target_height=ch,
+                crop_ratio="custom", crop_width=cw, crop_height=ch,
                 multiple_of=1)
         w, h = int(r[0].shape[2]), int(r[0].shape[1])
         assert w <= 2048 and h <= 3072, (cw, ch, w, h)
@@ -655,7 +776,7 @@ def test_a_custom_box_that_fits_is_left_alone():
     """Only an oversized box is scaled down; one that fits is taken as given."""
     r = run(image=image(1024, 1536), method="lanczos",
             target_mode="scale_factor", scale_factor=2.0, crop=True,
-            crop_ratio="custom", target_width=800, target_height=600,
+            crop_ratio="custom", crop_width=800, crop_height=600,
             multiple_of=1)
     assert (int(r[0].shape[2]), int(r[0].shape[1])) == (800, 600)
 
@@ -665,14 +786,167 @@ def test_every_crop_takes_the_largest_window_that_fits():
     """The promise across the whole crop stage: named formats and custom boxes
     alike give you as much of the image as their shape allows."""
     for kw in [dict(crop_ratio="1:1"), dict(crop_ratio="16:9"),
-               dict(crop_ratio="custom", target_width=3000, target_height=3000),
-               dict(crop_ratio="custom", target_width=6000, target_height=3000)]:
+               dict(crop_ratio="custom", crop_width=3000, crop_height=3000),
+               dict(crop_ratio="custom", crop_width=6000, crop_height=3000)]:
         r = run(image=image(1024, 1536), method="lanczos",
                 target_mode="scale_factor", scale_factor=2.0, crop=True,
                 crop_orientation="landscape", multiple_of=1, **kw)
         w, h = int(r[0].shape[2]), int(r[0].shape[1])
         # touching at least one edge is what "largest that fits" means
         assert w == 2048 or h == 3072, (kw, w, h)
+
+# ---------------------------------------------------------------- spatial
+#
+# The anchors, checked with a marker image: R encodes the x coordinate and G
+# the y coordinate, so the mean colour of a cut-out window says where it sat.
+# The custom box 1024x768 in the default 2048x3072 result leaves slack on
+# BOTH axes, which no named ratio can offer (they always fill one).
+
+@needs_comfy
+def _spatial(pos, off_x=0, off_y=0, mult=1, snap=False):
+    """A gradient upscaled 2x with a 1024x768 custom crop at the anchor."""
+    r = run(image=gradient(SRC_W, SRC_H), method="lanczos",
+            target_mode="scale_factor", scale_factor=2.0,
+            crop=True, crop_ratio="custom", crop_width=1024, crop_height=768,
+            crop_orientation="auto", crop_position=pos,
+            crop_offset_x=off_x, crop_offset_y=off_y,
+            snap=snap, multiple_of=mult)
+    return r[0][0]  # H,W,3 float 0..1
+
+
+def _mean(t, ch):
+    return float(t[..., ch].mean().item())
+
+
+@needs_comfy
+def test_anchors_sit_where_the_gradient_says():
+    left, center, right = (_mean(_spatial(p), 0)
+                           for p in ("left", "center", "right"))
+    assert left < center < right, (left, center, right)
+
+    top, bottom = (_mean(_spatial(p), 1)
+                   for p in ("top", "bottom"))
+    middle = _mean(_spatial("center"), 1)
+    assert top < middle < bottom, (top, middle, bottom)
+
+
+@needs_comfy
+def test_corner_anchors_hit_the_exact_corner_pixels():
+    """The four corners have no slack on their edges: the window's corner
+    pixel is the frame's corner pixel, so the markers read 0 or 1 there."""
+    tl = _spatial("top-left")
+    assert tl[0, 0, 0] < 0.06 and tl[0, 0, 1] < 0.06, (tl[0, 0, 0], tl[0, 0, 1])
+
+    tr = _spatial("top-right")
+    assert tr[0, -1, 0] > 0.94 and tr[0, -1, 1] < 0.06, (tr[0, -1, 0], tr[0, -1, 1])
+
+    bl = _spatial("bottom-left")
+    assert bl[-1, 0, 0] < 0.06 and bl[-1, 0, 1] > 0.94, (bl[-1, 0, 0], bl[-1, 0, 1])
+
+    br = _spatial("bottom-right")
+    assert br[-1, -1, 0] > 0.94 and br[-1, -1, 1] > 0.94, (br[-1, -1, 0], br[-1, -1, 1])
+
+
+@needs_comfy
+def test_snap_still_touches_the_exact_edges():
+    """The old drift: snapping the crop AFTER the anchor was placed pushed
+    right/bottom/corner placements off the edge. Use NON-multiple source and
+    crop dimensions (1000x1000 with 500x350 snapped to mult=64 -> 512x320)
+    so rounding actually changes box size in BOTH directions (up & down) and
+    every anchor must still land on the exact frame edge."""
+    src = gradient(1000, 1000)
+
+    def cut(pos):
+        r = run(image=src, method="nearest",
+                target_mode="scale_factor", scale_factor=1.0,
+                crop=True, crop_ratio="custom",
+                crop_width=500, crop_height=350,
+                crop_position=pos, snap=True, multiple_of=64)
+        out = r[0][0]
+        assert out.shape[1] % 64 == 0 and out.shape[0] % 64 == 0, out.shape
+        return out
+
+    for pos in ("left", "top-left", "bottom-left"):
+        t = cut(pos)
+        assert t[0, 0, 0] < 0.02, (pos, "left edge", float(t[0, 0, 0]))
+    for pos in ("right", "top-right", "bottom-right"):
+        t = cut(pos)
+        assert t[0, -1, 0] > 0.98, (pos, "right edge", float(t[0, -1, 0]))
+    for pos in ("top", "top-left", "top-right"):
+        t = cut(pos)
+        assert t[0, 0, 1] < 0.02, (pos, "top edge", float(t[0, 0, 1]))
+    for pos in ("bottom", "bottom-left", "bottom-right"):
+        t = cut(pos)
+        assert t[-1, 0, 1] > 0.98, (pos, "bottom edge", float(t[-1, 0, 1]))
+
+
+@needs_comfy
+def test_snap_with_an_ugly_box_stays_inside_and_on_the_multiple():
+    """A box that is not a multiple of the snap value comes back as the
+    nearest multiple that still fits the frame -- never a window that is off
+    the multiple AND touches an edge at the same time."""
+    r = run(image=image(SRC_W, SRC_H), method="lanczos",
+            target_mode="scale_factor", scale_factor=2.0, crop=True,
+            crop_ratio="custom", crop_width=1000, crop_height=700,
+            snap=True, multiple_of=8)
+    w, h = int(r[0].shape[2]), int(r[0].shape[1])
+    assert w % 8 == 0 and h % 8 == 0, (w, h)
+    assert (w, h) == (1000, 704), (w, h)      # 700 -> 704, the nearest fit
+
+
+@needs_comfy
+def test_all_ratios_all_orientations_on_every_shape():
+    """9 named formats x 3 orientations on portrait, landscape and square
+    sources: the window always fits, and the orientation lands where asked
+    (auto following the frame, a square keeping the format's natural way)."""
+    sources = [(1080, 1920), (1920, 1080), (1024, 1024)]
+    ratios = ["4:5", "1:1", "4:3", "3:2", "DIN", "16:10", "16:9", "2:1", "21:9"]
+    for sw, sh in sources:
+        for ratio in ratios:
+            for orient in ("auto", "portrait", "landscape"):
+                r = run(image=image(sw, sh), method="lanczos",
+                        target_mode="scale_factor", scale_factor=1.0,
+                        crop=True, crop_ratio=ratio, crop_orientation=orient)
+                w, h = int(r[0].shape[2]), int(r[0].shape[1])
+                assert 0 < w <= sw and 0 < h <= sh, (sw, sh, ratio, orient, w, h)
+                if ratio == "1:1":
+                    assert w == h, (sw, sh, ratio, orient, w, h)
+                    continue
+                if orient == "portrait":
+                    assert w < h, (sw, sh, ratio, orient, w, h)
+                elif orient == "landscape":
+                    assert w > h, (sw, sh, ratio, orient, w, h)
+                else:  # auto: follow the frame; a square keeps the natural one
+                    if sw < sh:
+                        assert w < h, (sw, sh, ratio, w, h)
+                    elif sw > sh:
+                        assert w > h, (sw, sh, ratio, w, h)
+                    else:
+                        if ratio == "DIN":
+                            assert w > h, (ratio, w, h)
+                            continue
+                        a, b = ratio.split(":")
+                        ar = float(a) / float(b)
+                        assert (w > h) == (ar > 1.0), (ratio, w, h)
+
+
+@needs_comfy
+def test_custom_crop_box_across_all_anchors_and_offsets():
+    """The dedicated box at every anchor, with and without offsets: the size
+    never changes and the window never leaves the frame."""
+    base = None
+    for pos in ("center", "top", "bottom", "left", "right",
+                "top-left", "top-right", "bottom-left", "bottom-right"):
+        for ox, oy in [(0, 0), (100, -50), (-9999, 9999)]:
+            r = run(image=image(SRC_W, SRC_H), method="lanczos",
+                    target_mode="scale_factor", scale_factor=2.0, crop=True,
+                    crop_ratio="custom", crop_width=1000, crop_height=700,
+                    crop_position=pos, crop_offset_x=ox, crop_offset_y=oy,
+                    snap=True, multiple_of=8)
+            size = (int(r[0].shape[2]), int(r[0].shape[1]))
+            base = base or size
+            assert size == base, (pos, ox, oy, size, base)
+
 
 # ---------------------------------------------------------------- alpha
 #
@@ -728,11 +1002,9 @@ def test_rgba_without_a_model_resizes_all_four_channels():
 
 
 @needs_comfy
-def test_rgb_stays_three_channels_and_latent_is_untouched_by_alpha():
-    r = run(image=image(SRC_W, SRC_H), method="lanczos", scale_factor=2.0,
-            samples=latent(128, 192))
+def test_rgb_stays_three_channels():
+    r = run(image=image(SRC_W, SRC_H), method="lanczos", scale_factor=2.0)
     assert r[0].shape[-1] == 3, r[0].shape
-    assert r[1]["samples"].shape[1] == 4, r[1]["samples"].shape
 
 
 @needs_comfy
@@ -779,18 +1051,6 @@ def test_corners_run_end_to_end_and_keep_the_size():
 
 
 @needs_comfy
-def test_corners_frame_image_and_latent_the_same():
-    for pos in ("top-left", "top-right", "bottom-left", "bottom-right"):
-        r = run(image=image(SRC_W, SRC_H), samples=latent(128, 192),
-                method="lanczos", target_mode="scale_factor", scale_factor=2.0,
-                crop=True, crop_ratio="16:9", crop_orientation="landscape",
-                crop_position=pos, multiple_of=1)
-        iw, ih = int(r[0].shape[2]), int(r[0].shape[1])
-        lw, lh = int(r[1]["samples"].shape[3]), int(r[1]["samples"].shape[2])
-        assert abs(iw / ih - lw / lh) < 0.05, (pos, iw, ih, lw, lh)
-
-
-@needs_comfy
 def test_corner_offsets_nudge_from_the_corner_and_clamp():
     # an 800x600 window in a 2000x1200 frame leaves slack on both axes,
     # which a named format (always filling one axis) cannot offer
@@ -804,6 +1064,7 @@ def test_corner_offsets_nudge_from_the_corner_and_clamp():
         assert 0 <= r[0] < r[2] <= 1.0001, (pos, r)
         assert 0 <= r[1] < r[3] <= 1.0001, (pos, r)
 
+
 # ---------------------------------------------------------------- resize_condition
 
 @needs_comfy
@@ -811,7 +1072,7 @@ def _rc(**kw):
     kw.setdefault("image", image(SRC_W, SRC_H))
     kw.setdefault("method", "lanczos")
     r = run(**kw)
-    return int(r[0].shape[2]), int(r[0].shape[1]), r[4]
+    return int(r[0].shape[2]), int(r[0].shape[1]), r[3]
 
 
 @needs_comfy
@@ -896,7 +1157,7 @@ def test_condition_skip_keeps_the_model_off_too(monkeypatch):
     assert "tensor" not in received, \
         "the model must not run when the resize is skipped"
     assert (int(r[0].shape[2]), int(r[0].shape[1])) == (SRC_W, SRC_H)
-    assert "skipped resize (downscale_only)" in r[4]
+    assert "skipped resize (downscale_only)" in r[3]
 
     # control: the same target with 'always' must run the model
     r = run(image=image(SRC_W, SRC_H), method="upscaler model",
@@ -938,20 +1199,6 @@ def test_custom_always_still_covers_and_crops():
 
 
 @needs_comfy
-def test_condition_skip_keeps_image_and_latent_in_step():
-    """The rule runs on each path's own dimensions, and a latent that is the
-    image divided by eight makes the same decision as the image -- so both
-    leave the node framed identically. No crop, so the skipped size itself
-    is what comes out."""
-    r = run(image=image(SRC_W, SRC_H), samples=latent(128, 192),
-            method="lanczos", target_mode="longest_side", longest_side=4096,
-            resize_condition="downscale_only")
-    assert (int(r[0].shape[2]), int(r[0].shape[1])) == (SRC_W, SRC_H)
-    assert tuple(r[1]["samples"].shape)[2:] == (192, 128)
-    assert "skipped resize (downscale_only)" in r[4]
-
-
-@needs_comfy
 def test_preview_agrees_with_the_node_on_skipped_resizes():
     upscale_crop._remember("rc", image(SRC_W, SRC_H))
     c = upscale_crop._LAST_IMAGE["rc"]
@@ -971,7 +1218,7 @@ def test_preview_agrees_with_the_node_on_skipped_resizes():
         p = upscale_crop._preview(d, c)
         r = run(image=image(SRC_W, SRC_H), **d)
         assert p["up"] == [int(r[0].shape[2]), int(r[0].shape[1])], (data, p["up"])
-        assert (p["skipped"] is None) == ("skipped resize" not in r[4]), (data, p)
+        assert (p["skipped"] is None) == ("skipped resize" not in r[3]), (data, p)
 
 
 @needs_comfy
@@ -987,7 +1234,7 @@ def test_preview_agrees_on_the_clamped_custom_box():
     assert p["up"] == [512, 384], p["up"]
     assert p["skipped"] == "downscale_only", p
     assert (int(r[0].shape[2]), int(r[0].shape[1])) == (512, 384)
-    assert p["crop"] == [512, 384], (p["crop"], r[4])
+    assert p["crop"] == [512, 384], (p["crop"], r[3])
 
 # ---------------------------------------------------------------- model cache
 #
@@ -1075,64 +1322,40 @@ def test_model_options_lists_the_folder_ranked(monkeypatch, tmp_path):
 
 # ---------------------------------------------------------------- io
 #
-# Input/output contracts: what happens when only one path is connected,
-# what the placeholders look like, and that batches survive.
+# Input/output contracts: what happens without an image, what the outputs
+# carry, and that batches survive.
 
 @needs_comfy
-def test_image_only_gives_a_wellformed_latent_placeholder():
-    r = run(image=image(512, 512), method="lanczos", scale_factor=2.0)
-    assert tuple(r[1]["samples"].shape) == (1, 4, 8, 8), r[1]["samples"].shape
-
-
-@needs_comfy
-def test_latent_only_gives_a_wellformed_image_placeholder():
-    r = run(samples=latent(64, 96), method="bicubic", scale_factor=2.0)
-    assert tuple(r[0].shape) == (1, 8, 8, 3), r[0].shape
-    assert tuple(r[1]["samples"].shape)[2:] == (192, 128), r[1]["samples"].shape
-
-
-@needs_comfy
-def test_neither_connected_is_a_clear_error():
+def test_no_image_is_a_clear_error():
+    """The image input is required and the node has no placeholder to fall
+    back on: an unconnected input must fail with a message that says so."""
     try:
         run(method="lanczos")
     except ValueError as exc:
-        assert "connect" in str(exc).lower(), str(exc)
+        assert "connect an image" in str(exc).lower(), str(exc)
     else:
         raise AssertionError("expected a ValueError naming the missing input")
 
 
 @needs_comfy
-def test_latent_is_sized_from_its_own_dimensions():
-    """Deliberately not image/8 -- the latent must not inherit the image's
-    target, it must compute its own from the same spec."""
-    r = run(image=image(1024, 1536), samples=latent(100, 150),
-            method="lanczos", target_mode="scale_factor", scale_factor=2.0,
-            multiple_of=1)
-    assert tuple(r[0].shape)[1:3] == (3072, 2048), r[0].shape
-    assert tuple(r[1]["samples"].shape)[2:] == (300, 200), r[1]["samples"].shape
+def test_outputs_are_image_width_height_and_info():
+    r = run(image=image(512, 512), method="lanczos", scale_factor=2.0)
+    assert isinstance(r[0], torch.Tensor), "output 0 must be the image"
+    assert (r[1], r[2]) == (int(r[0].shape[2]), int(r[0].shape[1])), r[1:3]
+    assert isinstance(r[3], str) and r[3], r[3]
 
 
 @needs_comfy
-def test_batches_survive_both_paths():
-    r = run(image=image(256, 384, b=3), samples=latent(32, 48, b=2),
-            method="lanczos", scale_factor=2.0)
+def test_batches_survive():
+    r = run(image=image(256, 384, b=3), method="lanczos", scale_factor=2.0)
     assert r[0].shape[0] == 3, r[0].shape
-    assert r[1]["samples"].shape[0] == 2, r[1]["samples"].shape
-
-
-@needs_comfy
-def test_latent_dict_extras_are_carried_through():
-    lat = latent(64, 64)
-    lat["noise_mask"] = torch.ones(1, 64, 64)
-    r = run(samples=lat, method="bicubic", scale_factor=2.0)
-    assert "noise_mask" in r[1], "extra latent keys must not be dropped"
 
 
 @needs_comfy
 def test_model_method_falls_back_when_nothing_is_selected():
     r = run(image=image(256, 384), method="upscaler model", scale_factor=2.0)
     assert tuple(r[0].shape)[1:3] == (768, 512), r[0].shape
-    assert "lanczos" in r[4], r[4]
+    assert "lanczos" in r[3], r[3]
 
 
 @needs_comfy
@@ -1140,33 +1363,28 @@ def test_model_is_skipped_on_a_downscale():
     r = run(image=image(1024, 1536), method="upscaler model", scale_factor=0.5,
             upscale_model="whatever.pth")
     assert tuple(r[0].shape)[1:3] == (768, 512), r[0].shape
-    assert "downscale" in r[4], r[4]
-
-
-@needs_comfy
-def test_width_and_height_outputs_match_the_image():
-    r = run(image=image(1024, 1536), method="lanczos", scale_factor=2.0)
-    assert (r[2], r[3]) == (int(r[0].shape[2]), int(r[0].shape[1]))
+    assert "downscale" in r[3], r[3]
 
 
 @needs_comfy
 def test_all_kernels_run():
     for k in ["lanczos", "bicubic", "bilinear", "nearest", "area"]:
-        r = run(image=image(256, 384), samples=latent(32, 48),
-                method=k, scale_factor=1.5)
-        assert r[0].shape[1] > 0 and r[1]["samples"].shape[2] > 0, k
+        r = run(image=image(256, 384), method=k, scale_factor=1.5)
+        assert r[0].shape[1] > 0, k
 
 
 @needs_comfy
 def test_none_values_from_the_frontend_do_not_crash():
-    """ComfyUI can send an untouched optional widget as an explicit null."""
+    """ComfyUI can send an untouched widget as an explicit null."""
     r = run(image=image(256, 256), method="lanczos",
             target_mode=None, multiple_of=None, scale_factor=None,
             crop=None, crop_ratio=None, crop_orientation=None,
+            crop_width=None, crop_height=None,
             target_width=None, target_height=None,
             crop_position=None, crop_offset_x=None, crop_offset_y=None,
             crop_seed=None)
     assert r[0].shape[0] == 1
+
 
 # ---------------------------------------------------------------- preview
 #
@@ -1208,7 +1426,7 @@ def test_preview_size_matches_what_the_node_produces():
         {"target_mode": "megapixels", "megapixels": 1.3},
     ]:
         for mult in [1, 8, 64]:
-            d = dict(data, method="lanczos", multiple_of=mult)
+            d = dict(data, method="lanczos", multiple_of=mult, snap=True)
             p = upscale_crop._preview(d, c)
             r = run(image=image(SRC_W, SRC_H), **d)
             assert p["up"] == [int(r[0].shape[2]), int(r[0].shape[1])], \
@@ -1221,9 +1439,9 @@ def test_preview_crop_size_matches_what_the_node_produces():
     for ratio in ["4:5", "1:1", "16:9", "DIN", "custom"]:
         for pos in ["center", "top", "left"]:
             d = {"target_mode": "scale_factor", "scale_factor": 2.0,
-                 "method": "lanczos", "multiple_of": 8, "crop": True,
+                 "method": "lanczos", "multiple_of": 8, "snap": True, "crop": True,
                  "crop_ratio": ratio, "crop_orientation": "portrait",
-                 "target_width": 1200, "target_height": 900,
+                 "crop_width": 1200, "crop_height": 900,
                  "crop_position": pos, "crop_offset_x": 0, "crop_offset_y": 0}
             p = upscale_crop._preview(d, c)
             r = run(image=image(SRC_W, SRC_H), **d)
@@ -1232,17 +1450,58 @@ def test_preview_crop_size_matches_what_the_node_produces():
 
 
 @needs_comfy
+def test_preview_custom_crop_falls_back_to_the_target_box():
+    """crop_width/crop_height absent from the payload: the node takes the
+    target box, and the preview must say exactly that."""
+    c = _cached()
+    d = {"target_mode": "scale_factor", "scale_factor": 2.0,
+         "method": "lanczos", "crop": True, "crop_ratio": "custom",
+         "target_width": 1200, "target_height": 900}
+    p = upscale_crop._preview(d, c)
+    r = run(image=image(SRC_W, SRC_H), **d)
+    assert p["crop"] == [int(r[0].shape[2]), int(r[0].shape[1])], (p["crop"], r[3])
+    assert p["box"] == [1200, 900], p["box"]
+
+
+@needs_comfy
 def test_preview_rect_is_normalised_and_inside_the_frame():
     c = _cached()
     for pos in ["center", "top", "bottom", "left", "right"]:
         for off in [-4000, 0, 4000]:
             d = {"target_mode": "scale_factor", "scale_factor": 2.0,
-                 "method": "lanczos", "multiple_of": 8, "crop": True,
+                 "method": "lanczos", "multiple_of": 8, "snap": True, "crop": True,
                  "crop_ratio": "16:9", "crop_orientation": "landscape",
                  "crop_position": pos, "crop_offset_y": off}
             x0, y0, x1, y1 = upscale_crop._preview(d, c)["rect"]
             assert 0 <= x0 < x1 <= 1.0001, (pos, off, x0, x1)
             assert 0 <= y0 < y1 <= 1.0001, (pos, off, y0, y1)
+
+
+@needs_comfy
+def test_preview_frame_cuts_the_same_pixels_as_the_node():
+    """The panel's promise: the window it draws is the window execute()
+    cuts. Re-cut the resized image with the preview's rect and it must equal
+    the node's output pixel for pixel, at every anchor, seed and snap."""
+    c = _cached()
+    img = image(SRC_W, SRC_H)     # one image for both sides of the comparison
+    for ratio in ["4:5", "16:9", "1:1", "DIN", "custom", "21:9"]:
+        for pos in ["center", "top", "bottom-left", "random"]:
+            for snap, mult in [(False, 1), (True, 8), (True, 64)]:
+                d = {"target_mode": "scale_factor", "scale_factor": 2.0,
+                     "method": "lanczos", "multiple_of": mult, "snap": snap,
+                     "crop": True, "crop_ratio": ratio,
+                     "crop_orientation": "auto", "crop_position": pos,
+                     "crop_seed": 7, "crop_width": 900, "crop_height": 700}
+                p = upscale_crop._preview(d, c)
+                r = run(image=img, **d)
+                assert p["crop"] == [int(r[0].shape[2]), int(r[0].shape[1])], \
+                    (ratio, pos, snap, p["crop"], r[0].shape)
+                assert p["rect"] is not None
+                work = upscale_crop._resize_image(img, int(p["up"][0]),
+                                                  int(p["up"][1]), "lanczos")
+                cut = upscale_crop._apply_rect(
+                    work, tuple(p["rect"]), float(mult) if snap else 0.0)
+                torch.testing.assert_close(cut, r[0])
 
 
 @needs_comfy
@@ -1266,3 +1525,105 @@ def test_preview_survives_rubbish_from_the_browser():
     ]:
         p = upscale_crop._preview(bad, c)
         assert p["ok"] and p["up"][0] > 0 and p["up"][1] > 0, (bad, p)
+
+
+@needs_comfy
+def test_random_ignores_fixed_offsets():
+    """Random placement must ignore crop_offset_x/y so it is never biased into a corner."""
+    src = gradient(512, 512)
+    r1 = run(image=src, method="nearest", target_mode="scale_factor", scale_factor=1.0,
+             crop=True, crop_ratio="custom", crop_width=256, crop_height=256,
+             crop_position="random", crop_seed=42, crop_offset_x=0, crop_offset_y=0)
+    r2 = run(image=src, method="nearest", target_mode="scale_factor", scale_factor=1.0,
+             crop=True, crop_ratio="custom", crop_width=256, crop_height=256,
+             crop_position="random", crop_seed=42, crop_offset_x=9999, crop_offset_y=-9999)
+    torch.testing.assert_close(r1[0], r2[0])
+
+
+@needs_comfy
+def test_ram_oom_guard_and_warnings(monkeypatch):
+    """RAM budget must warn above 35% of free RAM or >8192px, and block above 85% before allocating."""
+    # Hard OOM block: simulate only 50 MB free RAM when requesting a ~60 MB peak resize
+    monkeypatch.setattr(upscale_crop, "_available_ram_bytes", lambda: 50 * 1024 * 1024)
+    with pytest.raises(ValueError, match="OOM risk"):
+        run(image=image(1024, 1024), method="nearest", target_mode="scale_factor", scale_factor=1.0)
+    p_oom = upscale_crop._preview(
+        {"target_mode": "scale_factor", "scale_factor": 1.0, "method": "nearest"},
+        {"png": None, "w": 1024, "h": 1024, "b": 1, "c": 3},
+    )
+    assert p_oom["oom"] is True and p_oom["warning"] and "OOM risk" in p_oom["warning"]
+
+    # Soft RAM warning: simulate 120 MB free RAM for ~60 MB peak (50% > 35%, < 85%)
+    monkeypatch.setattr(upscale_crop, "_available_ram_bytes", lambda: 120 * 1024 * 1024)
+    r_warn = run(image=image(1024, 1024), method="nearest", target_mode="scale_factor", scale_factor=1.0)
+    assert "WARNING: high RAM" in r_warn[3], r_warn[3]
+    p_warn = upscale_crop._preview(
+        {"target_mode": "scale_factor", "scale_factor": 1.0, "method": "nearest"},
+        {"png": None, "w": 1024, "h": 1024, "b": 1, "c": 3},
+    )
+    assert p_warn["oom"] is False and p_warn["warning"] and "high RAM" in p_warn["warning"]
+
+    # Large side (>8192 px) warning even with huge free RAM
+    monkeypatch.setattr(upscale_crop, "_available_ram_bytes", lambda: 256 * 1024 ** 3)
+    p_side = upscale_crop._preview(
+        {"target_mode": "longest_side", "longest_side": 9000, "method": "lanczos"},
+        {"png": None, "w": 1024, "h": 512, "b": 1, "c": 3},
+    )
+    assert p_side["oom"] is False and p_side["warning"] and "large output" in p_side["warning"]
+
+
+@needs_comfy
+def test_model_pass_falls_back_to_cpu_on_gpu_oom(monkeypatch):
+    """When GPU OOMs even at tile=128, _model_pass must automatically fall back to CPU."""
+    class _OomOnGpuModel(FakeModel):
+        def __init__(self):
+            super().__init__({})
+            self.dev = "cpu"
+            self.devices_tried = []
+
+        def to(self, dev):
+            self.dev = str(dev)
+            return self
+
+        def __call__(self, x):
+            self.devices_tried.append(self.dev)
+            if self.dev.startswith("cuda"):
+                raise RuntimeError("CUDA out of memory")
+            return super().__call__(x)
+
+    fake_model = _OomOnGpuModel()
+
+    class _FakeCudaDevice:
+        type = "cuda"
+        def __str__(self):
+            return "cuda:0"
+
+    class _FakeMM:
+        OOM_EXCEPTION = RuntimeError
+        @staticmethod
+        def module_size(_m):
+            return 0
+        @staticmethod
+        def free_memory(_need, _dev):
+            pass
+        @staticmethod
+        def soft_empty_cache():
+            pass
+
+    monkeypatch.setattr(upscale_crop, "_load_upscale_model", lambda _n: fake_model)
+    monkeypatch.setattr(upscale_crop, "_device", lambda: _FakeCudaDevice())
+    monkeypatch.setattr(upscale_crop, "_cu", FakeCU)
+    monkeypatch.setattr(upscale_crop, "_mm", _FakeMM)
+    # Bypass Tensor.to(cuda) on CPU-only test environment by patching movedim/to via cpu passthrough
+    orig_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, dev, *a, **kw: self if getattr(dev, "type", str(dev)) == "cuda" else orig_to(self, dev, *a, **kw))
+
+    r = run(image=image(64, 64), method="upscaler model",
+            upscale_model="fake.pth", target_mode="scale_factor", scale_factor=2.0)
+    assert (r[1], r[2]) == (128, 128)
+    assert any(d.startswith("cuda") for d in fake_model.devices_tried), "must try GPU first"
+    assert "cpu" in fake_model.devices_tried, "must fall back to CPU"
+    assert "CPU fallback (GPU VRAM full)" in r[3], r[3]
+
+
+

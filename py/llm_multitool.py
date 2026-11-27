@@ -20,6 +20,7 @@ Route (answering {"ok": ...} JSON):
 import atexit
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -1169,4 +1170,4 @@ def register_routes():
                 return json_error(f"{type(exc).__name__}: {exc}")
             return web.json_response({"ok": True, "unloaded": done, "message": msg})
     except Exception as e:  # noqa: BLE001 - without a server (unit tests) no route
-        print(f"[MM Nodepack] routes not registered: {e}")
+        logging.getLogger(__name__).warning("[MM Nodepack] routes not registered (%s): %s", type(e).__name__, e)

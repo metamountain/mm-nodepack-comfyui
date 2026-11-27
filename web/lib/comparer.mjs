@@ -1,10 +1,10 @@
-// Compare slider for Preview Image MM - loaded on demand (dynamic import) by mm_nodepack.js
-// the first time a Preview Image MM node is created. Slider logic adapted from
+// Compare slider for Preview & Save MM - loaded on demand (dynamic import) by mm_nodepack.js
+// the first time a Preview & Save MM node is created. Slider logic adapted from
 // rgthree-comfy image_comparer.js (MIT). .mjs so ComfyUI does not load it as an extension.
 // Modes (button under the image, node property mm_compare): slide (rgthree "Slide"),
 // hold (rgthree "Click": original while the mouse button is held), off.
 import { app } from "../../../scripts/app.js";
-import { MM_THEME, loadImage } from "./mm_ui.mjs";
+import { MM_THEME, MIN_PREVIEW_HEIGHT, fitNodeSize, loadImage } from "./mm_ui.mjs";
 
 const MODES = ["hold", "slide", "off"];   // hold = default, first in the cycle
 const MODE_LABEL = { slide: "compare slide", hold: "compare hold", off: "compare off" };
@@ -42,7 +42,7 @@ export class ComparerWidget {
   mouse(e, pos) {
     const t = e?.type;
     if (t !== "pointerdown" && t !== "mousedown") return false;
-    if (this.hit(pos)) return true;
+    if (this.hit(pos, e)) return true;
     // hold mode: show the original while the button is held over the image (rgthree "Click")
     const ib = this.imageBounds;
     if (compareMode(this.node) === "hold" && ib && pos[1] >= ib.top && pos[1] <= ib.bottom) {
@@ -53,15 +53,20 @@ export class ComparerWidget {
   }
 
   // click on the variant bar (C1 C2 ...) or on the compare toggle under the image
-  hit(pos) {
+  hit(pos, e) {
+    // LiteGraph can deliver one click to both widget.mouse and node.onMouseDown:
+    // the same event object must trigger the handler only once (no double toggle)
+    if (e && this._lastHitEvent === e) return false;
     for (const b of this.barBounds) {
       if (pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + 16) {
+        this._lastHitEvent = e;
         this.selectVariant(b.i);
         return true;
       }
     }
     const tb = this.toggleBounds;
     if (tb && pos[0] >= tb.x && pos[0] <= tb.x + tb.w && pos[1] >= tb.y && pos[1] <= tb.y + tb.h) {
+      this._lastHitEvent = e;
       // display only, saved with the workflow
       (this.node.properties ??= {}).mm_compare = MODES[(MODES.indexOf(compareMode(this.node)) + 1) % MODES.length];
       this.node.setDirtyCanvas?.(true, true);
@@ -71,7 +76,14 @@ export class ComparerWidget {
   }
 
   computeLayoutSize() {
-    return { minHeight: this.value.b.length ? 160 : 40, minWidth: 1 };
+    if (!this.value.b.length) return { minHeight: 40, minWidth: 1 };
+    // Exact 1:1 parity with ComfyUI core LoadImage / PreviewImage / MMLoadImage
+    // (220 px preview area): add the comparer header (16 px) + compare button (26 px
+    // when an original is present) + variant bar (16 px for multi-variant batches)
+    // so the rendered image area matches core LoadImage pixel-for-pixel across all ARs.
+    const variantBar = this.value.b.length > 1 ? 16 : 0;
+    const compareBtn = this.imgA?.naturalWidth ? 26 : 0;
+    return { minHeight: MIN_PREVIEW_HEIGHT + 16 + variantBar + compareBtn, minWidth: 1 };
   }
 
   setData(aEntries, bEntries) {
@@ -79,18 +91,22 @@ export class ComparerWidget {
     this.selected = 0;
     this.imgA = this.value.a.length ? loadImage(this.value.a[0]) : null;
     this.imgB = this.value.b.length ? loadImage(this.value.b[this.selected]) : null;
-    const fit = () => {
-      // grow the node once so the image fits at the current width (never shrink what the user set)
-      const img = this.imgB;
-      const free = this.computedHeight ?? 0;
-      const bars = (this.value.b.length > 1 ? 16 : 0) + 16 + this._reserve() + 6;
-      const want = Math.min(900, Math.round((this.node.size[0] - 20) * img.naturalHeight / img.naturalWidth) + bars);
-      if (want > free) this.node.setSize([this.node.size[0], this.node.size[1] + (want - free)]);
+    // Match ComfyUI core LoadImage / PreviewImage: grow only to fit the standard
+    // 220 px preview minimum (never explode vertically on tall portrait ARs, and
+    // never shrink what the user manually resized).
+    const syncSize = () => {
+      fitNodeSize(this.node);
       this.node.setDirtyCanvas?.(true, true);
     };
-    if (this.imgB) this.imgB.onload = fit;
-    if (this.imgA) this.imgA.onload = () => this.node.setDirtyCanvas?.(true, true);
-    this.node.setDirtyCanvas?.(true, true);
+    if (this.imgB) {
+      this.imgB.onload = syncSize;
+      if (this.imgB.complete && this.imgB.naturalWidth) syncSize();
+    }
+    if (this.imgA) {
+      this.imgA.onload = syncSize;
+      if (this.imgA.complete && this.imgA.naturalWidth) syncSize();
+    }
+    syncSize();
   }
 
   // height of the widgets that sit below the comparer (target/saved/buttons)
@@ -118,6 +134,7 @@ export class ComparerWidget {
     if (i === this.selected || !this.value.b[i]) return;
     this.selected = i;
     this.imgB = loadImage(this.value.b[i]);
+    this.imgB.onload = () => this.node.setDirtyCanvas?.(true, true);  // redraw as soon as it loads
     this.node.setDirtyCanvas?.(true, true);
     this.node._rtRefreshButtons?.();
   }
@@ -229,11 +246,23 @@ export class ComparerWidget {
       offsetX = (nodeWidth - targetWidth) / 2;
     }
     const widthMultiplier = image.naturalWidth / targetWidth;
-    const sourceWidth = cropX != null ? (cropX - offsetX) * widthMultiplier : image.naturalWidth;
-    const destX = (nodeWidth - targetWidth) / 2;
+    const destX = (nodeWidth - targetWidth) / 2;   // === offsetX
     const destY = y + (height - targetHeight) / 2;
-    const destWidth = cropX != null ? cropX - offsetX : targetWidth;
     const destHeight = targetHeight;
+    let destWidth = targetWidth;
+    let sourceWidth = image.naturalWidth;
+    if (cropX != null) {
+      // clamp the pointer into the drawn area: left of a portrait image it would
+      // compute a negative sourceWidth and drawImage raises an IndexSizeError
+      const clampedX = Math.max(destX, Math.min(cropX, destX + targetWidth));
+      cropX = clampedX;
+      destWidth = clampedX - destX;
+      sourceWidth = destWidth * widthMultiplier;
+    }
+    if (cropX != null && destWidth <= 0) {
+      // pointer at/left of the left edge: nothing to clip (divider skipped too)
+      return { top: destY, bottom: destY + destHeight };
+    }
     ctx.save();
     ctx.beginPath();
     const gco = ctx.globalCompositeOperation;
@@ -324,8 +353,9 @@ export function wirePointer(node, widget) {
     node.setDirtyCanvas?.(true, false);
   };
   node.onMouseDown = (e, pos) => {
-    // variant bar / compare toggle hit test (bounds are set during draw)
-    if (widget.hit(pos)) return false; // consumed
+    // variant bar / compare toggle hit test (bounds are set during draw); the
+    // shared event guard in hit() keeps a double dispatch from double-toggling
+    if (widget.hit(pos, e)) return false; // consumed
     return origDown?.call(node, e, pos);
   };
 }

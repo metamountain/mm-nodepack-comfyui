@@ -273,7 +273,8 @@ def test_unload_openai_does_nothing(net, monkeypatch):
 @needs_comfy
 def test_scan_lists_text_only_and_skips_non_chat(tmp_path, monkeypatch):
     vis, txt = tmp_path / "vis", tmp_path / "txt"
-    vis.mkdir(); txt.mkdir()
+    vis.mkdir()
+    txt.mkdir()
     for f in ("Model-A-Q4.gguf", "mmproj-F16.gguf", "mmproj-BF16.gguf"):
         (vis / f).write_bytes(b"x")
     for f in ("Chat-B-Q4.gguf", "t5-xxl-encoder-Q8.gguf", "X-DFlash2-Q4.gguf", "mtp-head.gguf"):

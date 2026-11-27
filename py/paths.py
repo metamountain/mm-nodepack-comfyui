@@ -1,6 +1,6 @@
 """File-system plumbing of the MM Nodepack: origin lookup for uploads, the unified
-target resolution (single file + batch), folder batch picking, and the last-dialog
-folder memory (stored in ComfyUI's temp dir, never in the repository)."""
+target resolution (single file + batch), folder batch picking, and the per-mode
+last-dialog folder memory (stored in ComfyUI's temp dir, never in the repository)."""
 import json
 import os
 import random
@@ -189,6 +189,33 @@ def next_target(source: str, suffix: str = "_#", save_as: str = "", fmt: str = "
     return os.path.abspath(_pick_free(base, ext))
 
 
+def resolve_save_target(source, suffix, save_as, fmt):
+    """Next free save target, also for saves with NO source (e.g. a txt2img preview).
+    With a source: same rules as next_target() (ValueError when the source is missing).
+    Without a source: an absolute save_as is used as-is (an image extension in it wins,
+    a foreign extension is kept and the target ext appended), else the output dir –
+    save_as as a prefix (no escape from it) or stem 'preview'. Never overwrites."""
+    src = _clean(source)
+    if src:
+        src = os.path.abspath(src)
+        if not os.path.isfile(src):
+            raise ValueError(f"source not found: {src}")
+        base, ext = _target_base(src, suffix, save_as, fmt)
+    else:
+        sa = _clean(save_as)
+        if sa and os.path.isabs(sa):
+            root, bext = os.path.splitext(os.path.abspath(sa))
+            if bext.lower() in IMAGE_EXTS:
+                ext = bext.lower()
+                base = root
+            else:
+                ext = ".png" if fmt == "same as source" else _FMT_EXT.get(fmt, ".png")
+                base = os.path.abspath(sa)
+        else:  # empty or relative save_as -> the output dir (like _target_base(None, ...))
+            base, ext = _target_base(None, suffix, save_as, fmt)
+    return os.path.abspath(_pick_free(base, ext))
+
+
 def resolve_targets(images, source, suffix, save_as, fmt) -> list:
     """One target per image in the batch – running numbers (haus_1, haus_2, ...),
     never overwriting. Same rules as next_target, but the batch reserves its own
@@ -235,21 +262,42 @@ def last_dir_file() -> str:
     return os.path.join(d, "mm_nodepack_last_dir.json")
 
 
-def load_last_dir() -> str:
-    """Persisted last file-dialog folder ('' = none)."""
+def load_last_dir(mode: str = "open") -> str:
+    """Persisted last dialog folder for `mode` ('' = none). A legacy file that
+    holds one shared 'dir' entry answers with that dir for every mode."""
     try:
         with open(last_dir_file(), "r") as f:
-            return json.load(f).get("dir", "")
+            data = json.load(f)
     except Exception:  # noqa: BLE001
         return ""
+    if not isinstance(data, dict):
+        return ""
+    if "dir" in data:  # legacy file: one shared dir for all modes
+        val = data.get("dir", "")
+        return val if isinstance(val, str) else ""
+    value = data.get(mode, "")
+    return value if isinstance(value, str) else ""
 
 
-def save_last_dir(d: str) -> None:
-    """Persist the last file-dialog folder (survives reboot)."""
+def save_last_dir(path: str, mode: str = "open") -> None:
+    """Persist the last dialog folder per mode (survives reboot). A legacy
+    single-'dir' file is migrated: its dir seeds every mode exactly once."""
     try:
         p = last_dir_file()
         os.makedirs(os.path.dirname(p), exist_ok=True)
+        data = None
+        try:
+            with open(p, "r") as f:
+                stored = json.load(f)
+            if isinstance(stored, dict) and "dir" in stored:
+                data = {m: stored.get("dir", "") for m in ("open", "save", "folder")}
+            elif isinstance(stored, dict):
+                data = stored
+        except Exception:  # noqa: BLE001 – unreadable/missing file: start fresh
+            data = None
+        data = data if data is not None else {}
+        data[mode] = path
         with open(p, "w") as f:
-            json.dump({"dir": d}, f)
+            json.dump(data, f)
     except Exception:  # noqa: BLE001 – a failed write must never break the dialog
         pass

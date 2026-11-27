@@ -7,8 +7,10 @@ Run:
 Tests that depend on the V3 node API (comfy_api) are skipped when the interpreter
 does not provide it (e.g. a plain venv without ComfyUI's site-packages).
 """
+import json
 import os
 import sys
+import types
 
 import pytest
 import torch
@@ -41,6 +43,7 @@ from py.paths import (  # noqa: E402
     load_last_dir,
     next_target,
     resolve_folder_image,
+    resolve_save_target,
     resolve_source_like,
     resolve_targets,
     save_dir,
@@ -165,6 +168,39 @@ def test_resolve_source_like(tmp_path):
         with pytest.raises(NoSourceError):
             resolve_source_like({})
         assert isinstance(NoSourceError("x"), ValueError)
+
+
+def test_resolve_save_target_no_source(tmp_path):
+    d = str(tmp_path)
+    outp = os.path.join(d, "output")
+    os.makedirs(outp)
+    with FolderPathsStub(make_folder_paths_stub(os.path.join(d, "input"), outp, os.path.join(d, "temp"))):
+        # no source, no save_as -> output/preview_1.png
+        assert resolve_save_target("", "_#", "", "same as source") == os.path.join(outp, "preview_1.png")
+        open(os.path.join(outp, "preview_1.png"), "wb").close()
+        assert resolve_save_target("", "_#", "", "same as source") == os.path.join(outp, "preview_2.png"), \
+            "no source: never overwrites preview_1"
+        # no source, relative save_as -> a prefix inside the output dir (no escape)
+        assert resolve_save_target("", "_#", "flux/image", "png") == os.path.join(outp, "flux", "image_1.png")
+        # no source, absolute save_as with an image extension -> used as-is
+        absa = os.path.join(d, "abs.png")
+        assert resolve_save_target("", "", absa, "same as source") == absa
+        open(absa, "wb").close()
+        assert resolve_save_target("", "", absa, "same as source") == os.path.join(d, "abs_2.png"), \
+            "absolute save_as never overwrites"
+        # absolute save_as with a foreign extension keeps it and appends the target ext
+        absx = os.path.join(d, "photo.txt")
+        assert resolve_save_target("", "", absx, "same as source") == os.path.join(d, "photo.txt.png")
+        assert resolve_save_target("", "", absx, "jpg") == os.path.join(d, "photo.txt.jpg")
+
+
+def test_resolve_save_target_with_source(tmp_path):
+    src = _png(tmp_path / "haus.png")
+    assert resolve_save_target(src, "_#", "", "same as source") == next_target(src), \
+        "with a source: identical to next_target"
+    assert resolve_save_target(src, "_#", "neu", "jpg") == next_target(src, suffix="_#", save_as="neu", fmt="jpg")
+    with pytest.raises(ValueError):
+        resolve_save_target(str(tmp_path / "missing.png"), "_#", "", "same as source")
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +354,37 @@ def test_last_dir_written_outside_repo(tmp_path, monkeypatch):
         "no leftover last_dir.json in the repository root"
 
 
+def test_last_dir_per_mode_and_legacy_migration(tmp_path):
+    d = str(tmp_path)
+    temp_dir = os.path.join(d, "temp")
+    os.makedirs(temp_dir)
+    legacy = os.path.join(temp_dir, "mm_nodepack_last_dir.json")
+    with FolderPathsStub(make_folder_paths_stub(os.path.join(d, "in"), os.path.join(d, "out"), temp_dir)):
+        # per-mode round-trip: the three modes are kept separately
+        save_last_dir(temp_dir, "open")
+        save_last_dir(os.path.join(d, "save_dir"), "save")
+        save_last_dir(os.path.join(d, "folder_dir"), "folder")
+        assert load_last_dir("open") == temp_dir, "open mode keeps its own dir"
+        assert load_last_dir("save") == os.path.join(d, "save_dir"), "save mode keeps its own dir"
+        assert load_last_dir("folder") == os.path.join(d, "folder_dir"), "folder mode keeps its own dir"
+        # a legacy file (one shared 'dir' entry) answers for every mode
+        with open(legacy, "w") as f:
+            json.dump({"dir": os.path.join(d, "old")}, f)
+        assert load_last_dir("open") == os.path.join(d, "old"), "legacy 'dir' answers for open"
+        assert load_last_dir("folder") == os.path.join(d, "old"), "legacy 'dir' answers for folder"
+        # saving migrates: the legacy dir seeds every mode exactly once, 'dir' disappears
+        save_last_dir(os.path.join(d, "new_save"), "save")
+        with open(legacy) as f:
+            migrated = json.load(f)
+        assert "dir" not in migrated, "legacy 'dir' key is dropped on migration"
+        assert migrated == {"open": os.path.join(d, "old"),
+                            "save": os.path.join(d, "new_save"),
+                            "folder": os.path.join(d, "old")}, \
+            f"migration seeds all modes from the legacy dir: {migrated}"
+        assert load_last_dir("open") == os.path.join(d, "old"), "migrated open value readable"
+        assert load_last_dir("folder") == os.path.join(d, "old"), "migrated folder value readable"
+
+
 # ---------------------------------------------------------------------------
 # folder batch helpers
 # ---------------------------------------------------------------------------
@@ -369,12 +436,12 @@ def test_find_loader(tmp_path):
     src = _png(tmp_path / "haus.png")
     L = {"class_type": "MMLoadImage", "inputs": {"image": "x.png", "path": src}}
     pr = {"5": L, "6": {"class_type": "ImageInvert", "inputs": {"image": ["5", 0]}},
-          "7": {"class_type": "MMPreviewImage", "inputs": {"images": ["6", 0]}}}
+          "7": {"class_type": "MMPreviewSave", "inputs": {"images": ["6", 0]}}}
     assert image_io.find_loader(pr, "7", "auto") == ("5", ""), "auto: loader upstream"
-    pr2 = dict(pr, **{"9": dict(L), "8": {"class_type": "MMPreviewImage", "inputs": {"images": ["6", 0]}}})
+    pr2 = dict(pr, **{"9": dict(L), "8": {"class_type": "MMPreviewSave", "inputs": {"images": ["6", 0]}}})
     assert image_io.find_loader(pr2, "8", "auto")[0] == "5", "auto: upstream wins over a second loader"
     pr3 = dict(pr2, **{"10": {"class_type": "EmptyImage", "inputs": {}},
-                       "11": {"class_type": "MMPreviewImage", "inputs": {"images": ["10", 0]}}})
+                       "11": {"class_type": "MMPreviewSave", "inputs": {"images": ["10", 0]}}})
     lid, note = image_io.find_loader(pr3, "11", "auto")
     assert lid is None and "#5" in note and "#9" in note, f"auto: ambiguous -> note '{note}'"
     assert image_io.find_loader(pr3, "11", "#9") == ("9", ""), "select #9"
@@ -382,7 +449,7 @@ def test_find_loader(tmp_path):
         "select inside subgraph"
     assert image_io.find_loader(pr3, "11", "#42")[0] is None, "select unknown number -> None"
     one = {"5": L, "10": {"class_type": "EmptyImage", "inputs": {}},
-           "11": {"class_type": "MMPreviewImage", "inputs": {"images": ["10", 0]}}}
+           "11": {"class_type": "MMPreviewSave", "inputs": {"images": ["10", 0]}}}
     assert image_io.find_loader(one, "11", "auto")[0] == "5", "auto: only loader in the workflow"
 
 
@@ -406,6 +473,10 @@ def test_source_from_prompt(tmp_path):
 @needs_comfy
 def test_schemas():
     loader_schema = image_io.MMLoadImage.define_schema()
+    loader_inputs = [i.id for i in loader_schema.inputs]
+    assert loader_inputs == ["mode", "image", "path", "folder", "batch_mode", "index"], \
+        f"loader inputs: all six in required, in this order: {loader_inputs}"
+    assert all(i.optional is False for i in loader_schema.inputs), "loader inputs are all required (no optional)"
     loader_outputs = [o.id for o in loader_schema.outputs]
     assert loader_outputs == ["image", "mask", "width", "height", "path", "image_list", "index"], \
         f"loader outputs match expected order without 'sync': {loader_outputs}"
@@ -415,15 +486,125 @@ def test_schemas():
         "_output_slot_linked detects linked image_list slot"
     assert image_io._output_slot_linked({"5": {}, "8": {"inputs": {"images": ["5", 0]}}}, "5", 5) is False, \
         "_output_slot_linked returns False when image_list is unconnected"
-    preview = image_io.MMPreviewImage.define_schema()
+    assert image_io._output_slot_linked({"3:42": {}, "8": {"inputs": {"images": ["42", 5]}}}, "3:42", 5) is True, \
+        "_output_slot_linked: subgraph key matched by the plain node number"
+    assert image_io._output_slot_linked({"42": {}, "8": {"inputs": {"images": ["3:42", 5]}}}, "42", 5) is True, \
+        "_output_slot_linked: plain key matched by the subgraph-prefixed link"
+    assert image_io._output_slot_linked({"3:42": {}, "8": {"inputs": {"images": ["42", 0]}}}, "3:42", 5) is False, \
+        "_output_slot_linked: wrong slot stays False"
+    preview = image_io.MMPreviewSave.define_schema()
     preview_inputs = [i.id for i in preview.inputs]
-    assert "sync" not in preview_inputs, f"preview inputs have no 'sync': {preview_inputs}"
-    assert preview.display_name == "Preview Image MM" and preview.category == "MM Nodepack"
+    # exact set: no legacy 'sync' and no workflow-embedding toggle (PNG always embeds)
+    assert preview_inputs == ["images", "auto_save", "auto_send", "source", "suffix", "save_as", "format", "quality"], \
+        f"preview schema must expose exactly these 8 inputs in this order: {preview_inputs}"
+    assert preview.display_name == "Preview & Save MM" and preview.category == "MM Nodepack"
+    assert preview.node_id == "MMPreviewSave", "preview node_id is MMPreviewSave"
 
 
 @needs_comfy
 def test_node_list():
-    assert image_io.NODE_LIST == [image_io.MMLoadImage, image_io.MMPreviewImage], "NODE_LIST exports both nodes"
+    assert image_io.NODE_LIST == [image_io.MMLoadImage, image_io.MMPreviewSave], "NODE_LIST exports both nodes"
+
+
+# ---------------------------------------------------------------------------
+# MMLoadImage.execute: image_list stays in natural order (random mode included)
+# ---------------------------------------------------------------------------
+
+@needs_comfy
+def test_loader_image_list_natural_order_random_mode(tmp_path, monkeypatch):
+    """image_list is always the natural file order, even in random mode, so
+    image_list[index - 1] is exactly the loaded image in every mode."""
+    batch = os.path.join(str(tmp_path), "batch")
+    os.makedirs(batch)
+    for fname, color in (("img_1.png", (255, 0, 0)), ("img_2.png", (0, 255, 0)), ("img_10.png", (0, 0, 255))):
+        _png(os.path.join(batch, fname), (4, 4), color)
+    # slot 5 (image_list) linked -> execute returns the whole list
+    linked = {"5": {"class_type": "MMLoadImage", "inputs": {}},
+              "8": {"class_type": "X", "inputs": {"images": ["5", 5]}}}
+    monkeypatch.setattr(image_io.MMLoadImage, "hidden",
+                        types.SimpleNamespace(unique_id="5", prompt=linked))
+    monkeypatch.setattr(image_io, "_preview_entries", lambda tensors, cls: [])
+    try:
+        out = image_io.MMLoadImage.execute(image="", path="", mode="folder", folder=batch,
+                                           batch_mode=True, index=42)
+        img, mask, w, h, path, image_list, idx = out.args
+        files = list_folder_images(batch)
+        assert [os.path.basename(f) for f in files] == ["img_1.png", "img_2.png", "img_10.png"], "natural sort"
+        assert path in files, "random pick is a file of the folder"
+        pos = files.index(path)
+        assert len(image_list) == len(files), "image_list holds every image of the folder"
+        assert image_list[0][0, 0, 0, 0] == pytest.approx(1.0), "image_list[0] is img_1 (red)"
+        assert image_list[1][0, 0, 0, 1] == pytest.approx(1.0), "image_list[1] is img_2 (green)"
+        assert image_list[2][0, 0, 0, 2] == pytest.approx(1.0), "image_list[2] is img_10 (blue)"
+        assert image_list[pos] is img, "image_list[index - 1] is exactly the loaded image"
+        assert idx == pos + 1, "the index output matches the natural position of the loaded image"
+        # deterministic seed: the same index always picks the same file
+        again = image_io.MMLoadImage.execute(image="", path="", mode="folder", folder=batch,
+                                             batch_mode=True, index=42)
+        assert again.args[4] == path, "random: same seed -> same file"
+        # unlinked slot: the list stays the single loaded image
+        unlinked = {"5": {"class_type": "MMLoadImage", "inputs": {}},
+                    "8": {"class_type": "X", "inputs": {"images": ["5", 0]}}}
+        monkeypatch.setattr(image_io.MMLoadImage, "hidden",
+                            types.SimpleNamespace(unique_id="5", prompt=unlinked))
+        out2 = image_io.MMLoadImage.execute(image="", path="", mode="folder", folder=batch,
+                                            batch_mode=False, index=2)
+        img2, *_rest2 = out2.args
+        assert len(out2.args[5]) == 1, "unlinked image_list stays the single loaded image"
+        assert out2.args[4] == os.path.join(batch, "img_2.png"), "incremental index=2 -> second image"
+        assert out2.args[5][0] is img2, "the single-element list is the loaded image"
+    finally:
+        image_io._LAST_RESOLVED.pop("5", None)
+
+
+# ---------------------------------------------------------------------------
+# source_from_prompt: subgraph-prefixed loader IDs (_LAST_RESOLVED fallback)
+# ---------------------------------------------------------------------------
+
+@needs_comfy
+def test_source_from_prompt_subgraph_id_fallback(tmp_path):
+    src = os.path.abspath(str(_png(tmp_path / "haus.png")))
+    # folder input wired to another node: no plain folder string to resolve from
+    prompt = {"3:7": {"class_type": "MMLoadImage",
+                      "inputs": {"mode": "folder", "folder": ["1", 0]}}}
+    try:
+        # direct hit: execute stored under the full subgraph prompt key
+        image_io._LAST_RESOLVED["3:7"] = src
+        s = image_io.source_from_prompt(prompt, "3:7")
+        assert s is not None and s["path"] == src, "direct _LAST_RESOLVED hit by subgraph key"
+        # fallback: stored under the plain node number, looked up by the subgraph key
+        del image_io._LAST_RESOLVED["3:7"]
+        image_io._LAST_RESOLVED["7"] = src
+        s = image_io.source_from_prompt(prompt, "3:7")
+        assert s is not None and s["path"] == src, "fallback via the plain node number"
+    finally:
+        image_io._LAST_RESOLVED.pop("3:7", None)
+        image_io._LAST_RESOLVED.pop("7", None)
+
+
+# ---------------------------------------------------------------------------
+# MMPreviewSave: _save_batch always embeds the PNG workflow metadata
+# ---------------------------------------------------------------------------
+
+@needs_comfy
+def test_save_batch_png_always_embeds_metadata(tmp_path):
+    src = _png(tmp_path / "haus.png")
+    img, _mask = load_image_file(src)
+    one = img[0]
+    target = str(tmp_path / "saved.png")
+    image_io._save_batch([one], [target], "png", 95,
+                         {"1": {"class_type": "X", "inputs": {}}}, {"extra": 1})
+    with Image.open(target) as im:
+        assert "prompt" in im.info, "PNG save embeds the prompt metadata"
+        assert "extra" in im.info, "PNG save embeds the extra_pnginfo keys"
+    target2 = str(tmp_path / "saved2.png")
+    image_io._save_batch([one], [target2], "png", 95, None, None)
+    with Image.open(target2) as im:
+        assert "prompt" not in im.info, "no metadata only when prompt and extra_pnginfo are both None"
+    jpg = str(tmp_path / "saved.jpg")
+    image_io._save_batch([one], [jpg], "jpg", 95, {"1": {}}, None)
+    with Image.open(jpg) as im:
+        assert "prompt" not in im.info, "jpg never carries PNG text chunks"
 
 
 @needs_comfy
@@ -436,6 +617,59 @@ def test_make_source(tmp_path):
     assert s["name"] == "haus", "make_source name"
     assert tuple(s["image"].shape) == (1, 5, 8, 3), "make_source image tensor"
     assert "mask" in s and "path" in s and "image" in s, "make_source keys"
+
+
+# ---------------------------------------------------------------------------
+# MMLoadImage.validate_inputs (mode-dependent validation, needs comfy_api)
+# ---------------------------------------------------------------------------
+
+@needs_comfy
+def test_validate_inputs_modes(tmp_path):
+    batch = _make_batch_dir(tmp_path)
+    src = _png(tmp_path / "haus.png")
+    # folder mode: only the folder is validated, image is ignored (empty or set)
+    assert image_io.MMLoadImage.validate_inputs(image="", mode="folder", folder=batch) is True
+    assert image_io.MMLoadImage.validate_inputs(image="whatever.png", mode="folder", folder=batch) is True
+    assert isinstance(image_io.MMLoadImage.validate_inputs(mode="folder", folder=""), str), \
+        "folder mode with an empty folder -> error string"
+    # single mode: a valid path wins over an empty image
+    assert image_io.MMLoadImage.validate_inputs(image="", path=src, mode="single") is True
+    # single mode: path set but missing -> error
+    assert isinstance(image_io.MMLoadImage.validate_inputs(image="", path=str(tmp_path / "missing.png"), mode="single"), str), \
+        "single mode: missing path file -> error string"
+    # single mode: empty path and no image -> clear error
+    assert isinstance(image_io.MMLoadImage.validate_inputs(image="", path="", mode="single"), str), \
+        "single mode with neither path nor image -> error string"
+    # single mode: empty path, upload name that does not exist -> error
+    assert isinstance(image_io.MMLoadImage.validate_inputs(image="mm-test-no-such-file-12345.png", path="", mode="single"), str), \
+        "single mode: unknown upload name -> error string"
+
+
+# ---------------------------------------------------------------------------
+# Windows dialog script: the comdlg32 lpstrFile must stay empty for an empty name
+# (a bare "D:\\dir\\" makes GetOpenFileNameW/GetSaveFileNameW fail with
+# FNERR_INVALIDFILENAME). The logic is embedded in the child-process script,
+# so verify the guard in its source.
+# ---------------------------------------------------------------------------
+
+def test_win_dialog_script_empty_name_guard():
+    from py import dialog
+    lines = [l.strip() for l in dialog._WIN_DIALOG_SCRIPT.splitlines()]
+    i = lines.index("first = os.path.basename(name)")
+    assert lines[i + 1] == "if first and start_dir and os.path.isdir(start_dir):", \
+        f"lpstrFile start_dir join must be guarded by a non-empty name: {lines[i + 1]}"
+    assert lines[i + 2] == "first = os.path.join(start_dir, first)", "guard must protect the join itself"
+    assert "COM" not in "".join(lines[i:i + 3]), "the name logic must not touch the IFileDialog vtable"
+
+
+def test_save_tensor_accepts_single_batch_4d_tensor(tmp_path):
+    """Regression: /mm/image/save loads a [1,H,W,C] tensor; save_tensor must handle both 3D and single-batch 4D."""
+    src = _png(tmp_path / "in.png")
+    img, _ = load_image_file(src)
+    assert img.ndim == 4 and img.shape[0] == 1
+    out3 = save_tensor(img[0], str(tmp_path / "out3.png"))
+    out4 = save_tensor(img[:1], str(tmp_path / "out4.png"))
+    assert os.path.isfile(out3) and os.path.isfile(out4)
 
 
 if __name__ == "__main__":

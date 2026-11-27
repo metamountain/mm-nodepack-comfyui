@@ -56,7 +56,7 @@ app.registerExtension({
     name: "MM.LLMMultitool",
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData?.name !== NODE) return;
+        if (nodeData?.name !== NODE) return;  // the MM logo is attached centrally by web/mm_logo.js
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

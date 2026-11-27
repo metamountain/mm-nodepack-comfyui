@@ -177,6 +177,8 @@ def save_tensor(img, target: str, quality: int = 95, pnginfo=None) -> str:
     if ext not in IMAGE_EXTS:
         raise ValueError(f"unsupported target extension: {ext!r}")
     os.makedirs(os.path.dirname(target), exist_ok=True)
+    if img.ndim == 4 and img.shape[0] == 1:
+        img = img[0]
     arr = np.clip(255.0 * img.cpu().numpy(), 0, 255).astype(np.uint8)
     pil = Image.fromarray(arr)
     if ext == ".png":

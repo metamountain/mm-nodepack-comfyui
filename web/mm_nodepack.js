@@ -1,18 +1,21 @@
 // MM Nodepack (category "MM Nodepack"): target preview, per-variant save buttons,
 // loader helpers. The compare slider lives in lib/comparer.mjs and is only loaded
-// when a Preview Image MM node exists (dynamic import).
+// when a Preview & Save MM node exists (dynamic import).
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import {
-  toast, debounce, viewBlob, loadImage, setWidgetVisible, setWidgetDim, fitNodeSize,
+  toast, debounce, viewBlob, loadImage, setWidgetVisible, setWidgetObjVisible, setWidgetDim, fitNodeSize,
 } from "./lib/mm_ui.mjs";
 
-const SAVE_NODES = new Set(["MMPreviewImage"]);
+const SAVE_NODES = new Set(["MMPreviewSave"]);
 const LOADER = "MMLoadImage";
 
-// compare slider module, loaded once on first use
+// runtime-created nodes can lack comfyClass (only .type is set): check both
+const nodeClass = (n) => n?.comfyClass || n?.type;
+
+// compare slider module, loaded once on first use (?v= busts the browser cache)
 let comparerModule = null;
-const loadComparer = () => (comparerModule ??= import("./lib/comparer.mjs"));
+const loadComparer = () => (comparerModule ??= import("./lib/comparer.mjs?v=7"));
 
 // ---------------------------------------------------------------------------
 // Shared node wiring: target preview widget + source lookup + pointer handling.
@@ -35,7 +38,7 @@ function loaderBody(loader) {
 function findLoader(node) {
   const g = node.graph || app.graph;
   const linkOf = (id) => (id == null ? null : (g.links?.get?.(id) ?? g.links?.[id]));
-  const loaders = (g._nodes || []).filter((n) => n.comfyClass === LOADER && n.mode !== 2 && n.mode !== 4);
+  const loaders = (g._nodes || []).filter((n) => nodeClass(n) === LOADER && n.mode !== 2 && n.mode !== 4);
   const sel = String(node.widgets?.find((w) => w.name === "source")?.value ?? "auto").trim().replace(/^#/, "").trim();
   if (sel && sel.toLowerCase() !== "auto") {
     const n = loaders.find((x) => String(x.id) === sel);
@@ -51,7 +54,7 @@ function findLoader(node) {
     seen.add(l.id);
     const src = g.getNodeById(l.origin_id);
     if (!src) continue;
-    if (src.comfyClass === LOADER) { found.add(src); continue; }
+    if (nodeClass(src) === LOADER) { found.add(src); continue; }
     for (const i of src.inputs || []) if (i.link != null) stack.push(i.link);
   }
   if (found.size === 1) return { node: [...found][0], note: "" };
@@ -86,7 +89,7 @@ const _refreshCmp = debounce(async (loaderNode) => {
   if (!j?.ok || !j.view) return;
   const aEntry = j.view;
   for (const n of g._nodes || []) {
-    if (n.comfyClass !== "MMPreviewImage") continue;
+    if (nodeClass(n) !== "MMPreviewSave") continue;
     const { node: src } = findLoader(n);
     if (src !== loaderNode) continue;
     n._rtRefreshTarget?.();  // folder/index/batch_mode changed -> live target tooltip
@@ -212,13 +215,19 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     return b;
   };
   const wv = (name, d) => node.widgets?.find((x) => x.name === name)?.value ?? d;
-  // server side: next free name next to the source (never overwrites)
+  // server side: next free name next to the source (never overwrites); with no
+  // loader in the graph the server saves to saveAs or output/preview_#.png
   const serverSave = async (saveAs, loader) => {
     if (!sourcePath && !loader) {
-      loader = await resolveLoader(node);
-      if (!loader) return { ok: false };
+      const r = findLoader(node);
+      if (r.node) {
+        loader = r.node;
+      } else if (r.many?.length > 1) {
+        loader = await chooseLoader(node, r.many);
+        if (!loader) return { ok: false };
+      }
     }
-    const base = loaderBody(loader);
+    const base = loader ? loaderBody(loader) : {};
     if (sourcePath) { base.mode = "single"; base.path = ""; base.image = ""; base.folder = ""; }
     const body = {
       ...base,
@@ -243,9 +252,12 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   const btn1 = mk("save");
   btn1.tooltip = node._rtTarget || "next free _# name next to the source";
   // no known home folder -> save behaves like save as: pasted images (Ctrl+V -> input/pasted/) and
-  // uploads whose original was not found (picking/uploading leaves the loader's path empty then)
+  // uploads whose original was not found (picking/uploading leaves the loader's path empty then).
+  // With no loader at all there is no home to be unknown: 'save' goes to output/preview_#.png,
+  // 'save as…' opens the dialog.
   const isPasted = () => {
     const ln = findLoader(node)?.node;
+    if (!ln && !sourcePath) return false;
     const lw = (name) => String(ln?.widgets?.find((x) => x.name === name)?.value ?? "");
     // folder mode: 'path' is empty by design – only a missing folder means 'unknown home'
     if (ln && lw("mode") === "folder") return !lw("folder").trim();
@@ -258,9 +270,12 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   btn2.tooltip = "choose folder and name";
   btn2.callback = async () => {
     const suggested = (node._rtTarget ? String(node._rtTarget).replace(/\\/g, "/").split("/").pop() : "") || `${stem}_edit.png`;
-    // the normal OS "save as" dialog (browser on the ComfyUI computer), starts in the target folder
+    // the normal OS "save as" dialog (browser on the ComfyUI computer), starts in the target folder;
+    // a loader in folder mode has no path: start in its folder instead
     const ln = findLoader(node)?.node;
-    const start = node._rtTarget || sourcePath || String(ln?.widgets?.find((x) => x.name === "path")?.value || "");
+    const lw = (name) => String(ln?.widgets?.find((x) => x.name === name)?.value ?? "");
+    const lnFolder = String(ln?.widgets?.find((x) => x.name === "folder")?.value ?? "");
+    const start = node._rtTarget || sourcePath || (ln && lw("mode") === "folder" ? lnFolder : "") || lw("path");
     let d;
     try {
       d = await (await api.fetchApi("/mm/image/dialog", { method: "POST", body: JSON.stringify({ mode: "save", path: start, name: suggested }) })).json();
@@ -317,6 +332,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
       loader._rtPathShown = j.path;
       loader.imgs = [img];
       loader.imageIndex = 0;
+      loader._mmEnsureSize?.();  // the loader shows an image now: give the thumbnail room
       app.graph.setDirtyCanvas(true, true);
     };
     loader.setDirtyCanvas?.(true, true);
@@ -326,14 +342,21 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   node._rtSendToLoader = sendToLoader;
   // the most used ones at the bottom: save and save as last
   const order = [btn3, btn1, btn2];
-  for (const b of order) node.widgets.splice(node.widgets.indexOf(b), 1);
+  for (const b of order) {
+    const idx = node.widgets.indexOf(b);
+    if (idx !== -1) node.widgets.splice(idx, 1);
+  }
   node.widgets.push(...order);
   node._rtButtons = [btn1, btn2, btn3];
   applyAutoState(node);
+  fitNodeSize(node);
   node._rtRemoveButtons = () => {
-    for (const b of node._rtButtons || []) node.widgets?.splice(node.widgets.indexOf(b), 1);
+    for (const b of node._rtButtons || []) {
+      const idx = node.widgets?.indexOf(b);
+      if (idx != null && idx !== -1) node.widgets.splice(idx, 1);
+    }
     node._rtButtons = null;
-    node.computeSize?.();
+    fitNodeSize(node, { shrinkHeight: true });
     node.setDirtyCanvas?.(true, true);
   };
 }
@@ -364,8 +387,19 @@ app.registerExtension({
       // buttons for the selected creation (save _# / save as…)
       const sel = cmp?.selected ?? 0;
       if (b[sel]) addSaveButtons(this, b[sel], source, sel);
+      else this._rtRemoveButtons?.();  // nothing selected (e.g. 0 images): stale buttons must go
       if (b[sel] && this.widgets?.find((w) => w.name === "auto_send")?.value === true) {
-        this._rtSendToLoader?.(saved[sel] || "");
+        // never auto-overwrite an ambiguous or folder-batch loader
+        const r = findLoader(this);
+        if (!r.node) {
+          if (r.many?.length > 1) {
+            toast("warn", "Auto-send skipped", "Multiple Load Image MM nodes found — pick one in 'source'");
+          }
+        } else if (String(r.node.widgets?.find((x) => x.name === "mode")?.value || "single") === "folder") {
+          toast("warn", "Auto-send skipped", `Loader #${r.node.id} is in folder mode — click "send to loader" to switch to single mode`);
+        } else {
+          this._rtSendToLoader?.(saved[sel] || "");
+        }
       }
       this._rtRefreshButtons = () => {
         const c = this.widgets?.find((w) => w.name === "comparer");
@@ -380,9 +414,19 @@ app.registerExtension({
       this._rtRefreshTarget?.();  // images link changed -> source may change
       this.setDirtyCanvas?.(true, true);
     };
+
+    // reloading a workflow restores the auto_save/auto_send values: refresh the live
+    // target label and the dimmed state of the buttons the switches already cover
+    const origConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const r = origConfigure?.apply(this, arguments);
+      this._rtRefreshTarget?.();
+      applyAutoState(this);
+      return r;
+    };
   },
   nodeCreated(node) {
-    if (node.comfyClass === LOADER) {
+    if (nodeClass(node) === LOADER) {
       const iw = node.widgets?.find((w) => w.name === "image");
       const pw = node.widgets?.find((w) => w.name === "path");
       const mw = node.widgets?.find((w) => w.name === "mode");
@@ -391,74 +435,215 @@ app.registerExtension({
       const idxw = node.widgets?.find((w) => w.name === "index");
       const ctrlw = node.widgets?.find((w) => w.name === "control_after_generate");
 
-      const upw = node.widgets?.find((w) => w.name === "upload" || w.type === "button");
-      const origUpload = upw?.callback;
-      if (upw) {
-        upw.label = "load image";
-        upw.serialize = false;
-        upw.options = { ...(upw.options || {}), serialize: false };
+      // pre-0.2.0 workflows saved other mode values ("image" etc.): normalize to
+      // single/folder at every entry point and on serialize
+      const repairMode = () => {
+        if (!mw) return;
+        if (mw.value !== "single" && mw.value !== "folder") mw.value = "single";
+      };
+      repairMode();
+      const mcb = mw?.callback;
+      if (mw) {
+        mw.serializeValue = () => (String(mw.value) === "folder" ? "folder" : "single");
+        // route user combo changes through setMode (setMode calls mcb directly, no recursion)
+        mw.callback = function (v) {
+          const r = mcb?.apply(this, arguments);
+          setMode(String(v ?? mw.value));
+          return r;
+        };
       }
 
+      // mirrors the Python _clean: strip + remove matching surrounding quotes
+      const cleanPath = (s) => {
+        let t = String(s ?? "").trim();
+        if (t.length >= 2 && ((t[0] === '"' && t[t.length - 1] === '"') || (t[0] === "'" && t[t.length - 1] === "'"))) {
+          t = t.slice(1, -1).trim();
+        }
+        return t;
+      };
+
+      // move an already-added widget directly after `anchor` without ever duplicating it
+      const moveAfter = (widget, anchor) => {
+        if (!widget || !anchor || !node.widgets) return;
+        const cur = node.widgets.indexOf(widget);
+        if (cur !== -1) node.widgets.splice(cur, 1);
+        const at = node.widgets.indexOf(anchor);
+        if (at !== -1) node.widgets.splice(at + 1, 0, widget);
+        else node.widgets.push(widget);
+      };
+
+      // the core upload button (if this frontend ships one) keeps its natural slot right
+      // below 'image' and is relabeled "choose file" (the click handler prefers the OS
+      // dialog; browser upload is only the fallback for a remote browser)
+      let upw = node.widgets?.find((w) => w.name === "upload")
+        || node.widgets?.find((w) => w.type === "button" && w.name !== "choose folder");
+      const origUpload = upw?.callback;
+      if (!upw) {
+        // this frontend ships no core upload button: own fallback
+        upw = node.addWidget("button", "choose file", null, () => {});
+      }
+      upw.label = "choose file";
+      upw.serialize = false;
+      upw.options = { ...(upw.options || {}), serialize: false };
+      // Always place "choose file" directly below 'image' (core appends 'upload' at the tail)
+      moveAfter(upw, iw);
+
+      // the "choose folder" button lives right below the 'folder' widget (visible only in folder mode)
       const folderBtn = node.addWidget("button", "choose folder", null, () => {});
+      folderBtn.label = "choose folder";
       folderBtn.serialize = false;
       folderBtn.options = { ...(folderBtn.options || {}), serialize: false };
+      moveAfter(folderBtn, fw);
 
-      // Place the two non-serialized mode buttons at the top: "load image" first, "choose folder" below.
-      const moveToTop = (btn, idx) => {
-        if (!btn || !node.widgets) return;
-        const cur = node.widgets.indexOf(btn);
-        if (cur !== -1) node.widgets.splice(cur, 1);
-        node.widgets.splice(idx, 0, btn);
+      // one shared stale-thumbnail guard for both modes
+      let thumbSeq = 0;
+
+      // Match original ComfyUI LoadImage & Preview & Save MM: let ComfyUI's native
+      // setSizeForImage handle image sizing (same 220 px preview minimum), and never
+      // shrink what the user set (mode switches never crush the thumbnail).
+      const sizeLoaderNode = (forImage) => {
+        if (!node.graph) {
+          if (node._mmSizeQueued) {
+            if (forImage) node._mmSizeForImage = true;
+            return;
+          }
+          node._mmSizeQueued = true;
+          node._mmSizeForImage = Boolean(forImage);
+          requestAnimationFrame(() => {
+            node._mmSizeQueued = false;
+            if (node.graph) sizeLoaderNode(node._mmSizeForImage);
+          });
+          return;
+        }
+        const prevW = node.size?.[0] ?? 0;
+        const prevH = node.size?.[1] ?? 0;
+        if (forImage && node.imgs?.length) {
+          node.setSizeForImage?.();
+        }
+        const min = node.computeSize?.();
+        if (!min || !node.size) return;
+        const w = Math.max(prevW, node.size[0], min[0]);
+        const minWithImg = (forImage && node.imgs?.length) ? min[1] : min[1];
+        const h = Math.max(prevH, node.size[1], minWithImg);
+        node.setSize?.([w, h]);
+        node.arrange?.();
+        node.setDirtyCanvas?.(true, true);
       };
-      if (upw) moveToTop(upw, 0);
-      moveToTop(folderBtn, upw ? 1 : 0);
+      node._mmEnsureSize = () => sizeLoaderNode(true);
 
       const getMode = () => (String(mw?.value || "single") === "folder" ? "folder" : "single");
 
       const applyMode = () => {
         const isFolder = getMode() === "folder";
-        // widgets stay in node.widgets (widgets_values is positional): hide via type/visibility
-        setWidgetVisible(node, "mode", false);
+        // the mode selector is always visible; the other schema widgets and the two mode
+        // buttons follow the mode. Widgets stay in node.widgets (widgets_values is
+        // positional): hide via type/visibility.
+        setWidgetVisible(node, "mode", true);
         setWidgetVisible(node, "image", !isFolder);
         setWidgetVisible(node, "path", !isFolder);
         setWidgetVisible(node, "folder", isFolder);
         setWidgetVisible(node, "batch_mode", isFolder);
         setWidgetVisible(node, "index", isFolder);
         setWidgetVisible(node, "control_after_generate", isFolder);
-        // mode buttons: active = bright, inactive = dimmed (still clickable to switch mode)
-        setWidgetDim(upw, isFolder);
-        setWidgetDim(folderBtn, !isFolder);
-        fitNodeSize(node);
+        if (!isFolder) {
+          // the index control only means anything in folder mode: park it on fixed
+          if (ctrlw && ctrlw.value !== "fixed") {
+            (node.properties ??= {}).mm_folder_ctrl = ctrlw.value;
+            ctrlw.value = "fixed";
+            ctrlw.callback?.(ctrlw.value);
+          }
+        } else if (ctrlw) {
+          ctrlw.value = node.properties?.mm_folder_ctrl || (bmw?.value ? "randomize" : "increment");
+          ctrlw.callback?.(ctrlw.value);
+        }
+        setWidgetObjVisible(node, upw, !isFolder);
+        setWidgetObjVisible(node, folderBtn, isFolder);
+        sizeLoaderNode(false);
       };
 
       const setMode = (next) => {
         const val = next === "folder" ? "folder" : "single";
         if (mw && mw.value !== val) {
           mw.value = val;
-          mw.callback?.(val);
+          mcb?.call(mw, val);
           node.graph?.change?.();
         }
         applyMode();
         _refreshCmp(node);
         if (val === "folder") refreshFolderThumb();  // switching back shows the right thumbnail
+        else refreshSingleThumb();
       };
       node._mmSetMode = setMode;
 
-      const openFolderDialog = async () => {
+      // one click = OS file dialog on the ComfyUI computer (real server paths, external
+      // folders included via the temp folder). Cancel = nothing changes. A remote browser
+      // (local === false) falls back to its own browser upload.
+      upw.callback = async function (...args) {
         let d;
         try {
           d = await (await api.fetchApi("/mm/image/dialog", {
             method: "POST",
-            body: JSON.stringify({ mode: "folder", path: String(fw?.value || "") }),
+            body: JSON.stringify({ mode: "open", path: cleanPath(pw?.value) }),
+          })).json();
+        } catch (e) {
+          d = { ok: false, error: String(e) };
+        }
+        if (d?.ok) {
+          if (d.path) {
+            if (pw) pw.value = d.path;
+            node.graph?.change?.();
+            const seq = ++thumbSeq;
+            node._rtPathShown = cleanPath(d.path);
+            node.imgs = undefined;
+            if (d.view) {
+              const img = loadImage(d.view);
+              const applyThumb = () => {
+                if (seq !== thumbSeq || getMode() !== "single") return;
+                node.imgs = [img];
+                node.imageIndex = 0;
+                sizeLoaderNode(true);  // the thumbnail needs room: grow once, never crush
+                node.setDirtyCanvas?.(true, true);
+              };
+              img.onload = applyThumb;
+              if (img.complete && img.naturalWidth) applyThumb();
+            } else {
+              refreshSingleThumb();
+            }
+            node.setDirtyCanvas?.(true, true);
+            _refreshCmp(node);
+          }
+          return;  // dialog cancelled (no path): nothing changes
+        }
+        if (d?.local === false) {
+          if (origUpload) {
+            const r = await origUpload.apply(this, args);
+            _refreshCmp(node);
+            return r;
+          }
+          toast("error", "Choose file", "no OS file dialog here and no browser upload (remote server)");
+          return;
+        }
+        toast("error", "Choose file", d?.error || "failed");
+      };
+
+      // one click = OS folder dialog; cancel = nothing changes. A folder dialog exists only
+      // on the ComfyUI computer: a remote browser gets an error toast (no browser fallback).
+      folderBtn.callback = async () => {
+        let d;
+        try {
+          d = await (await api.fetchApi("/mm/image/dialog", {
+            method: "POST",
+            body: JSON.stringify({ mode: "folder", path: cleanPath(fw?.value) }),
           })).json();
         } catch (e) {
           d = { ok: false, error: String(e) };
         }
         if (!d?.ok) {
-          toast("error", "Choose folder", d?.error || "failed");
+          if (d?.local === false) toast("error", "Choose folder", "folder dialogs only work from a browser on the ComfyUI computer");
+          else toast("error", "Choose folder", d?.error || "failed");
           return;
         }
-        if (!d.path) return;
+        if (!d.path) return;  // dialog cancelled: nothing changes
         if (fw) {
           fw.value = d.path;
           fw.callback?.(d.path);
@@ -470,28 +655,6 @@ app.registerExtension({
         // fw.callback above already triggered refreshFolderThumb: it loads the exact image for
         // the current index/batch_mode (external folders included via the temp-folder thumbnails)
         _refreshCmp(node);
-      };
-
-      if (upw) {
-        upw.callback = async function (...args) {
-          const wasFolder = getMode() === "folder";
-          setMode("single");
-          const hasFile = Boolean(String(pw?.value || "").trim() || String(iw?.value || "").trim());
-          if (!wasFolder || !hasFile) {
-            const r = await origUpload?.apply(this, args);
-            _refreshCmp(node);
-            return r;
-          }
-        };
-      }
-
-      folderBtn.callback = async () => {
-        const wasSingle = getMode() === "single";
-        setMode("folder");
-        const hasFolder = Boolean(String(fw?.value || "").trim());
-        if (!wasSingle || !hasFolder) {
-          await openFolderDialog();
-        }
       };
 
       if (iw && pw) {
@@ -516,15 +679,16 @@ app.registerExtension({
                   _refreshCmp(node);
                 };
                 setPath(j.path);
+                if (!cb || !node.imgs?.length) refreshSingleThumb();  // the picker loaded no thumbnail of its own
                 // identical copies in several folders: the browser never tells which one -> say so
-                if (j.candidates?.length > 1) toast("warn", "Same image in several folders", `${j.candidates.join(" · ")} → use "load image" to pick the exact one`);
+                if (j.candidates?.length > 1) toast("warn", "Same image in several folders", `${j.candidates.join(" · ")} → use "choose file" to pick the exact one`);
               })
               .catch(() => {});
           }
           return r;
         };
         const clearThumb = () => {
-          if (String(pw.value || "").trim() === "") return;
+          if (cleanPath(pw.value) === "") return;
           node.imgs = undefined;
           if (node.images) node.images = undefined;
           try { app.nodeOutputs && delete app.nodeOutputs[String(node.id)]; } catch (_) { /* ignore */ }
@@ -533,19 +697,19 @@ app.registerExtension({
         pw.callback = function () {
           const r = pcb?.apply(this, arguments);
           clearThumb();
+          refreshSingleThumb();  // pasting/typing a path shows the image right away
           _refreshCmp(node);
           node.setDirtyCanvas?.(true, true);
           return r;
         };
       }
 
-      // Folder mode: keep the loader's own thumbnail on the resolved image,
-      // so typing 1, 2, 3 ... immediately shows the selected file.
-      // Debounced + sequence-guarded: with a rapid index change (1 -> 2 -> 3 -> 4) a slow
-      // response for an older index must never overwrite the newer thumbnail.
-      let thumbSeq = 0;
-      const doRefreshFolderThumb = debounce(() => {
-        if (getMode() !== "folder" || !String(fw?.value || "").trim()) return;
+      // Both modes keep the loader's own thumbnail on the resolved image,
+      // so stepping the index or typing a path immediately shows the file.
+      // Debounced with a shared sequence guard: with a rapid change (1 -> 2 -> 3 -> 4)
+      // a slow response for an older selection must never overwrite the newer thumbnail.
+      const refreshFolderThumb = debounce(() => {
+        if (getMode() !== "folder" || !cleanPath(fw?.value)) return;
         const seq = ++thumbSeq;
         const body = { ...loaderBody(node), mode: "folder" };
         api.fetchApi("/mm/image/preview", { method: "POST", body: JSON.stringify(body) })
@@ -556,15 +720,37 @@ app.registerExtension({
             const img = loadImage(j.view);
             img.onload = () => {
               if (seq !== thumbSeq) return;
-              node._rtPathShown = j.path;
+              node._rtPathShown = cleanPath(j.path);
               node.imgs = [img];
               node.imageIndex = 0;
+              sizeLoaderNode(true);  // a visible image needs room in the node
               node.setDirtyCanvas?.(true, true);
             };
           })
           .catch(() => {});
       }, 150);
-      const refreshFolderThumb = () => doRefreshFolderThumb();
+      const refreshSingleThumb = debounce(() => {
+        if (getMode() !== "single") return;
+        if (!cleanPath(pw?.value) && !String(iw?.value || "").trim()) return;
+        const seq = ++thumbSeq;
+        const body = { ...loaderBody(node), mode: "single" };
+        api.fetchApi("/mm/image/preview", { method: "POST", body: JSON.stringify(body) })
+          .then((res) => res.json())
+          .then((j) => {
+            if (seq !== thumbSeq || getMode() !== "single") return;
+            if (!j?.ok || !j.view) return;
+            const img = loadImage(j.view);
+            img.onload = () => {
+              if (seq !== thumbSeq) return;
+              node._rtPathShown = cleanPath(j.path);
+              node.imgs = [img];
+              node.imageIndex = 0;
+              sizeLoaderNode(true);  // a visible image needs room in the node
+              node.setDirtyCanvas?.(true, true);
+            };
+          })
+          .catch(() => {});
+      }, 150);
 
       if (fw) {
         const fcb = fw.callback;
@@ -605,8 +791,14 @@ app.registerExtension({
       const origCfg = node.onConfigure;
       node.onConfigure = function () {
         const r = origCfg?.apply(this, arguments);
+        repairMode();  // legacy workflows: normalize the mode value
         applyMode();
-        if (getMode() === "folder") refreshFolderThumb();  // reloading a saved workflow in folder mode
+        // reloaded workflow: show its current source (single: path or the image widget, e.g. pasted)
+        if (getMode() === "folder") {
+          if (cleanPath(fw?.value)) refreshFolderThumb();
+        } else if (cleanPath(pw?.value) || String(iw?.value || "").trim()) {
+          refreshSingleThumb();
+        }
         return r;
       };
       applyMode();
@@ -616,22 +808,23 @@ app.registerExtension({
         origExec?.apply(this, arguments);
         // the backend previews the resolved file -> this thumbnail is the right one
         const shownPath = Array.isArray(message?.path) && message.path.length ? String(message.path[0] || "") : String(this.widgets?.find((w) => w.name === "path")?.value || "");
-        this._rtPathShown = Array.isArray(message?.images) && message.images.length ? shownPath : "";
+        this._rtPathShown = Array.isArray(message?.images) && message.images.length ? cleanPath(shownPath) : "";
         this.setDirtyCanvas?.(true, true);
       };
       const origBg = node.onDrawBackground;
       node.onDrawBackground = function () {
-        // single path mode: drop the picker's thumbnail if it belongs to another path
+        // single path mode: drop the picker's thumbnail if it belongs to another path;
+        // both sides cleaned, so a quoted path never wipes its own thumbnail
         const isFolder = getMode() === "folder";
         if (!isFolder) {
-          const pv = String(this.widgets?.find((w) => w.name === "path")?.value || "").trim();
-          if (pv && this.imgs?.length && this._rtPathShown !== pv) this.imgs = undefined;
+          const pv = cleanPath(this.widgets?.find((w) => w.name === "path")?.value);
+          if (pv && this.imgs?.length && cleanPath(this._rtPathShown) !== pv) this.imgs = undefined;
         }
         return origBg?.apply(this, arguments);
       };
       return;
     }
-    if (!SAVE_NODES.has(node.comfyClass)) return;
+    if (!SAVE_NODES.has(nodeClass(node))) return;
     // comparer goes right after the input widgets (before target line and buttons)
     const at = node.widgets?.length ?? 0;
     loadComparer().then(({ ComparerWidget, wirePointer }) => {
@@ -641,6 +834,7 @@ app.registerExtension({
       if (i > at) { ws.splice(i, 1); ws.splice(at, 0, cmp); }
       wirePointer(node, cmp);
       if (node._rtPending) { cmp.setData(...node._rtPending); node._rtPending = null; }
+      fitNodeSize(node);
       node.setDirtyCanvas?.(true, true);
     }).catch((e) => console.error("[MM Nodepack] comparer not loaded", e));
     addTargetWidget(node);
@@ -662,6 +856,11 @@ app.registerExtension({
       w.callback = (...a) => {
         const r = cb?.(...a);
         applyAutoState(node);
+        if (name === "auto_send" && w.value === true) {
+          // several loaders: let the user pick once, so the auto-send has a target
+          const rl = findLoader(node);
+          if (!rl.node && rl.many?.length > 1) chooseLoader(node, rl.many);
+        }
         return r;
       };
     }

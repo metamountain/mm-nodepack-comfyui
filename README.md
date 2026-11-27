@@ -20,9 +20,9 @@ Click any node for the full reference (the exact same pages also appear inside C
 
 | Node | Display Name | What It Does | Help Page |
 |---|---|---|---|
-| `MMLoadImage` | **Load Image MM** | Single image (upload or real path) + folder batching (`incremental`, `random`, `image list`, `index`) with OS folder picker | [MMLoadImage.md](web/docs/MMLoadImage.md) |
-| `MMPreviewImage` | **Preview Image MM** | Live preview, built-in compare (`hold` / `slide` / `off`), wireless source sync, non-overwriting save (`_1`, `_2`, …), `save as…`, `send to loader`, `auto_save` / `auto_send` | [MMPreviewImage.md](web/docs/MMPreviewImage.md) |
-| `MMUpscaleCrop` | **Upscale Crop MM** | 6 sizing modes (up & downscale), built-in upscale model widget (OOM-safe tiling, automatic alpha preservation), 9-position + random crop with draggable live preview, failsafe `resize_condition`, image + latent | [MMUpscaleCrop.md](web/docs/MMUpscaleCrop.md) |
+| `MMLoadImage` | **Load Image MM** | Single image (1-click OS file dialog, drag-drop/paste, or real path) + folder batching (`incremental`, `random`, natural-order `image list`, `index`) with OS folder picker | [MMLoadImage.md](web/docs/MMLoadImage.md) |
+| `MMPreviewSave` | **Preview & Save MM** | Live preview, built-in compare (`hold` / `slide` / `off`), wireless source sync, non-overwriting save (`_1`, `_2`, …, PNGs always embed workflow metadata), `save as…`, `send to loader`, safe `auto_save` / `auto_send` | [MMPreviewSave.md](web/docs/MMPreviewSave.md) |
+| `MMUpscaleCrop` | **Upscale Crop MM** | Image-only: 6 sizing modes (`scale_factor` default, up & downscale, remembered last setting), built-in upscale model (`lanczos` default, GPU → tile-halving → CPU auto-fallback, RAM-OOM guard, alpha preservation), 9-position + random crop with draggable live preview, failsafe `resize_condition` | [MMUpscaleCrop.md](web/docs/MMUpscaleCrop.md) |
 | `MMLLMMultitool` | **LLM Multitool MM** | Vision & text LLM calls (`auto` / `vision` / `text`) for llama.cpp, NInfer, Ollama, Unsloth Studio, and OpenAI-compatible APIs, optional local GGUF server, VRAM unload button | [MMLLMMultitool.md](web/docs/MMLLMMultitool.md) |
 
 Also includes a compact **Free GPU** toolbar tile showing ComfyUI's reserved VRAM and unloading models on click.

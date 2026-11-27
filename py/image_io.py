@@ -1,7 +1,7 @@
 """The MM Nodepack nodes (V3 node API, comfy_api.latest) and their HTTP routes.
 
 MMLoadImage ("Load Image MM"): load a single image (upload or full path) or batch
-from a folder. MMPreviewImage ("Preview Image MM"): preview, compare, save.
+from a folder. MMPreviewSave ("Preview & Save MM"): preview, compare, save.
 Routes (/mm/image/*, all answering {"ok": ...} JSON):
   /mm/image/target  – next free save target for the loader's current source
   /mm/image/dialog  – OS open/save/folder dialog on the ComfyUI computer
@@ -10,6 +10,7 @@ Routes (/mm/image/*, all answering {"ok": ...} JSON):
   /mm/image/save    – save a preview image next to its source (never overwrites)
 """
 import asyncio
+import logging
 import os
 
 from PIL import PngImagePlugin
@@ -30,7 +31,6 @@ from .common import (
     png_text_chunks,
     preview_view_entry,
     save_tensor,
-    view_entry,
 )
 from .dialog import dialog_available, file_dialog
 from .paths import (
@@ -39,6 +39,7 @@ from .paths import (
     load_last_dir,
     next_target,
     resolve_folder_image,
+    resolve_save_target,
     resolve_source,
     resolve_source_like,
     resolve_targets,
@@ -100,7 +101,9 @@ _LAST_RESOLVED = {}  # str(loader unique_id) -> last resolved absolute image pat
 
 
 def _output_slot_linked(prompt, node_id, slot_index: int) -> bool:
-    """True when any node in `prompt` connects to output `slot_index` of `node_id`."""
+    """True when any node in `prompt` connects to output `slot_index` of `node_id`.
+    Subgraph-safe: prompt keys look like '3:42' while a link may store the plain
+    node number (or vice versa) – both directions are matched."""
     if not isinstance(prompt, dict) or node_id is None:
         return False
     want = str(node_id)
@@ -108,7 +111,10 @@ def _output_slot_linked(prompt, node_id, slot_index: int) -> bool:
         if not isinstance(node, dict):
             continue
         for v in (node.get("inputs") or {}).values():
-            if isinstance(v, list) and len(v) == 2 and str(v[0]) == want and v[1] == slot_index:
+            if not (isinstance(v, list) and len(v) == 2):
+                continue
+            src = str(v[0])
+            if (src == want or src.endswith(":" + want) or want.endswith(":" + src)) and v[1] == slot_index:
                 return True
     return False
 
@@ -158,7 +164,9 @@ def source_from_prompt(prompt, loader_id):
         if isinstance(folder, str) and isinstance(index, int) and not isinstance(index, bool):
             p, _, _ = resolve_folder_image(folder, bool(batch_mode), int(index))
             return make_source(p)
-        last = _LAST_RESOLVED.get(str(loader_id))
+        # subgraph-safe: the loader may be known by its full prompt key ('3:7') or
+        # its plain node number ('7') – the execute side wrote either form
+        last = _LAST_RESOLVED.get(str(loader_id)) or _LAST_RESOLVED.get(str(loader_id).split(":")[-1])
         if last and os.path.isfile(last):
             return make_source(last)
         return None
@@ -168,12 +176,15 @@ def source_from_prompt(prompt, loader_id):
     return make_source(resolve_source(image, path))
 
 
-def _save_batch(images, targets, fmt, quality, embed_workflow, prompt, extra_pnginfo) -> list:
-    """Save every image of the batch to its target. Returns the written paths."""
+def _save_batch(images, targets, fmt, quality, prompt, extra_pnginfo) -> list:
+    """Save every image of the batch to its target. Returns the written paths.
+    PNG saves ALWAYS embed the prompt + workflow metadata (like core SaveImage)."""
     paths = []
     for i, img in enumerate(images):
         target = targets[i]
-        pnginfo = png_metadata(prompt, extra_pnginfo) if (embed_workflow and os.path.splitext(target)[1].lower() == ".png") else None
+        pnginfo = None
+        if os.path.splitext(target)[1].lower() == ".png" and (prompt is not None or extra_pnginfo is not None):
+            pnginfo = png_metadata(prompt, extra_pnginfo)
         save_tensor(img, target, quality=quality, pnginfo=pnginfo)
         paths.append(target)
     return paths
@@ -198,21 +209,20 @@ class MMLoadImage(io.ComfyNode):
             display_name="Load Image MM",
             category=CATEGORY,
             description="Load a single image (upload or full path) or batch from a folder (incremental or random). "
-                        "Preview Image MM automatically detects the source.",
+                        "Preview & Save MM automatically detects the source.",
             search_aliases=ALIASES + ["mm load", "load image mm", "load image path", "load image folder", "batch"],
             inputs=[
-                io.Combo.Input("image", options=_input_images(), upload=io.UploadType.image,
-                               tooltip="upload from ComfyUI/input (used when 'path' is empty)"),
-                io.String.Input("path", default="", optional=True,
-                                tooltip="full file path – wins over the upload; Preview Image MM saves next to this file"),
-                io.Combo.Input("mode", options=["single", "folder"], default="single", optional=True,
+                io.Combo.Input("mode", options=["single", "folder"], default="single",
                                tooltip="single image or folder batch"),
-                io.String.Input("folder", default="", optional=True,
+                io.Combo.Input("image", options=_input_images() or [""], upload=io.UploadType.image,
+                               tooltip="upload from ComfyUI/input (used when 'path' is empty)"),
+                io.String.Input("path", default="",
+                                tooltip="full file path – wins over the upload; Preview & Save MM saves next to this file"),
+                io.String.Input("folder", default="",
                                 tooltip="folder containing images for incremental or random loading"),
-                io.Boolean.Input("batch_mode", default=False, label_on="random", label_off="incremental", optional=True,
+                io.Boolean.Input("batch_mode", default=False, label_on="random", label_off="incremental",
                                  tooltip="incremental: step through folder in natural order; random: pick using index as seed"),
-                io.Int.Input("index", default=1, min=1, max=0xFFFFFFFFFFFFFFFF,
-                             control_after_generate=ctrl_inc, optional=True,
+                io.Int.Input("index", default=1, min=1, max=0xFFFFFFFFFFFFFFFF, control_after_generate=ctrl_inc,
                              tooltip="1-based image index for incremental (1 = first image, wraps after last) or seed for random"),
             ],
             outputs=[
@@ -252,6 +262,7 @@ class MMLoadImage(io.ComfyNode):
     @classmethod
     def validate_inputs(cls, image="", path="", mode="single", folder="", batch_mode=False, index=1):
         if mode == "folder":
+            # folder mode: only the folder is validated (image/path are ignored)
             f = _clean(folder)
             if not f:
                 return "folder is empty – click 'choose folder' or enter a folder path"
@@ -261,10 +272,24 @@ class MMLoadImage(io.ComfyNode):
             if not list_folder_images(abs_f):
                 return f"no supported images found in folder: {abs_f}"
             return True
-        p = _clean(path)
-        if p and not os.path.isfile(os.path.abspath(p)):
-            return (f"path points to a missing file (moved or deleted?): {os.path.abspath(p)} – "
-                    "pick or upload an image (that sets a new path) or clear the path field")
+        # single mode: 'path' wins over the upload combo
+        p = _clean(str(path))
+        if p:
+            if not os.path.isfile(os.path.abspath(p)):
+                return (f"path points to a missing file (moved or deleted?): {os.path.abspath(p)} – "
+                        "pick or upload an image (that sets a new path) or clear the path field")
+            return True
+        if isinstance(image, (list, tuple)):  # wired to an output: resolved at run time
+            return True
+        img = _clean(str(image))
+        if not img:
+            return "no image selected: use 'choose file' or enter a file path"
+        try:
+            fp = get_folder_paths().get_annotated_filepath(img)
+        except Exception:  # noqa: BLE001 – no ComfyUI runtime (unit tests)
+            return True
+        if not os.path.isfile(os.path.abspath(fp)):
+            return f"image not found: {os.path.abspath(fp)} – use 'choose file' or enter a file path"
         return True
 
     @classmethod
@@ -283,11 +308,9 @@ class MMLoadImage(io.ComfyNode):
         img, mask = load_image_file(p)
         h, w = int(img.shape[1]), int(img.shape[2])
         if mode == "folder" and _output_slot_linked(prompt, uid, 5):
+            # always the natural sort order (even in random mode): image_list[index - 1]
+            # must stay the loaded image in every mode
             files = list_folder_images(folder)
-            if batch_mode:
-                files = list(files)
-                import random
-                random.Random(int(index)).shuffle(files)
             image_list = [img if f == p else load_image_file(f)[0] for f in files]
         else:
             image_list = [img]
@@ -298,28 +321,30 @@ class MMLoadImage(io.ComfyNode):
 
 
 # ---------------------------------------------------------------------------
-# Node 2: Preview Image MM (preview + compare + save; auto save = save every run)
+# Node 2: Preview & Save MM (preview + compare + save; auto save = save every run)
 # ---------------------------------------------------------------------------
 
-class MMPreviewImage(io.ComfyNode):
+class MMPreviewSave(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="MMPreviewImage",
-            display_name="Preview Image MM",
+            node_id="MMPreviewSave",
+            display_name="Preview & Save MM",
             category=CATEGORY,
             is_output_node=True,
             description="Preview the creations, compare them with the original (slider) and save the selected one "
                         "next to the source per button (name_1, name_2 … or save as) – or every run with auto_save. "
-                        "Uploads (ComfyUI/input) are saved to ComfyUI/output.",
-            search_aliases=ALIASES + ["mm preview", "mm save", "preview image mm", "save image mm", "compare"],
+                        "Uploads (ComfyUI/input) are saved to ComfyUI/output. "
+                        "PNG saves always embed the prompt + workflow metadata.",
+            search_aliases=ALIASES + ["mm preview", "mm save", "preview save mm", "preview image mm", "save image mm", "compare"],
             inputs=[
                 io.Image.Input("images"),
                 io.Boolean.Input("auto_save", default=False, label_on="auto save", label_off="no autosave",
                                  tooltip="on: every run saves all creations; off: preview only, save with the buttons"),
                 io.Boolean.Input("auto_send", default=False, label_on="auto send", label_off="no autosend",
                                  tooltip="on: after every run the result is saved as _# and put into the Load Image MM, "
-                                         "so the next run edits it (with auto save on, the auto-saved file is used)"),
+                                         "so the next run edits it (with auto save on, the auto-saved file is used); "
+                                         "skipped (with a toast) when several loaders exist or the loader is in folder mode"),
                 io.String.Input("source", default="auto",
                                 tooltip="auto = the Load Image MM upstream (or the only one); "
                                         "with several loaders type its number, e.g. #12"),
@@ -329,7 +354,6 @@ class MMPreviewImage(io.ComfyNode):
                                 tooltip="auto save only: empty = next to the source with the suffix; a name or a full path"),
                 io.Combo.Input("format", options=FORMATS, default="same as source"),
                 io.Int.Input("quality", default=95, min=1, max=100, tooltip="jpg/webp quality"),
-                io.Boolean.Input("embed_workflow", default=True, tooltip="embed prompt + workflow into the PNG (png only)"),
             ],
             outputs=[
                 io.String.Output("saved_paths", display_name="saved", tooltip="one path per line (auto save)"),
@@ -339,7 +363,7 @@ class MMPreviewImage(io.ComfyNode):
 
     @classmethod
     def execute(cls, images, auto_save=False, source="auto", suffix="_#", save_as="",
-                format="same as source", quality=95, embed_workflow=True, auto_send=False):
+                format="same as source", quality=95, auto_send=False):
         # auto_send is done by the browser after the run (same path as the "send to loader" button)
         if images is None or len(images) == 0:
             raise ValueError("no images to preview")
@@ -356,7 +380,7 @@ class MMPreviewImage(io.ComfyNode):
         paths = []
         if auto_save:
             targets = resolve_targets(images, sync, suffix, save_as, format)
-            paths = _save_batch(images, targets, format, quality, embed_workflow,
+            paths = _save_batch(images, targets, format, quality,
                                 cls.hidden.prompt, cls.hidden.extra_pnginfo)
         entries = _preview_entries(images, cls)
         # always send the original: the compare toggle under the image is display-only, so turning it on later works without a re-run
@@ -373,7 +397,7 @@ class MMPreviewImage(io.ComfyNode):
         return io.NodeOutput("\n".join(paths), ui=ui_out)
 
 
-NODE_LIST = [MMLoadImage, MMPreviewImage]
+NODE_LIST = [MMLoadImage, MMPreviewSave]
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +434,7 @@ def register_routes():
                 cur = _clean(str(data.get("path", "")))
                 start = (cur if os.path.isdir(cur) else os.path.dirname(cur)) if cur else ""
                 if not start or not os.path.isdir(start):
-                    start = load_last_dir()
+                    start = load_last_dir(mode)
                 if not start or not os.path.isdir(start):
                     start = fp.get_output_directory()
                 p = await asyncio.to_thread(file_dialog, mode, os.path.abspath(start), os.path.basename(str(data.get("name", ""))))
@@ -420,12 +444,13 @@ def register_routes():
                         try:
                             files = list_folder_images(p)
                             count = len(files)
-                            if files:
-                                first_view = view_entry(files[0])
+                            # preview_view_entry: folders outside input/ still get a /view thumbnail
+                            first_view = preview_view_entry(files[0]) if files else None
                         except Exception:  # noqa: BLE001
                             pass
                     return web.json_response({"ok": True, "path": p, "count": count, "view": first_view})
-                return web.json_response({"ok": True, "path": p, "view": view_entry(p) if p and mode == "open" else None})
+                return web.json_response({"ok": True, "path": p,
+                                          "view": preview_view_entry(p) if p and mode == "open" else None})
             except Exception as e:  # noqa: BLE001
                 return json_error(str(e))
 
@@ -491,13 +516,18 @@ def register_routes():
                         src = resolve_source_like(data)
                     except NoSourceError:
                         src = ""
-                if not src:
-                    src = os.path.join(fp.get_output_directory(), "preview.png")
-                else:
+                suffix = str(data.get("suffix", "_#"))
+                save_as = str(data.get("save_as", ""))
+                if src:
+                    # a source the loader does not know is a 404, not a silent fallback
                     src = os.path.abspath(src)
-                if not os.path.isfile(src):
-                    return json_error(f"source not found: {src}", status=404)
-                target = next_target(src, str(data.get("suffix", "_#")), str(data.get("save_as", "")), fmt)
+                    if not os.path.isfile(src):
+                        return json_error(f"source not found: {src}", status=404)
+                    target = next_target(src, suffix, save_as, fmt)
+                else:
+                    # no loader in the graph (e.g. txt2img preview): save_as as-is
+                    # (absolute) or the output dir (preview_#.png) – never overwrites
+                    target = resolve_save_target("", suffix, save_as, fmt)
                 if os.path.splitext(target)[1].lower() not in IMAGE_EXTS:
                     return json_error(f"target extension not allowed: {os.path.splitext(target)[1]}")
                 out_dir = os.path.abspath(fp.get_output_directory())
@@ -512,9 +542,9 @@ def register_routes():
                     pnginfo = PngImagePlugin.PngInfo()
                     for k, v in png_text_chunks(src_file).items():
                         pnginfo.add_text(k, v)
-                save_tensor(img[:1], target, quality=int(data.get("quality", 95)), pnginfo=pnginfo)
+                save_tensor(img[0], target, quality=int(data.get("quality", 95)), pnginfo=pnginfo)
                 return web.json_response({"ok": True, "path": target})
             except Exception as e:  # noqa: BLE001
                 return json_error(str(e))
     except Exception as e:  # noqa: BLE001 - without a server (unit tests) no route
-        print(f"[MM Nodepack] routes not registered: {e}")
+        logging.getLogger(__name__).warning("[MM Nodepack] routes not registered (%s): %s", type(e).__name__, e)

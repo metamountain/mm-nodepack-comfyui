@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
 tmp/
-mm_local.py
 last_dir.json
 mm_nodepack_last_dir.json
