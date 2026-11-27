@@ -377,8 +377,8 @@ class MMPreviewSave(io.ComfyNode):
                                          "Next run edits it. "
                                          "Skipped (toast) with several loaders or folder mode."),
                 io.String.Input("source", default="auto",
-                                tooltip="auto = the Load Image MM upstream (or the only one); "
-                                        "with several loaders, type its number, e.g. #12"),
+                                tooltip="Shown only when several Load Image MM nodes could be the source. "
+                                        "auto = upstream or the only loader; #id = pin one, e.g. #12"),
                 io.String.Input("suffix", default="_#",
                                 tooltip="Added to the source name. # = next free number (name_1, name_2 …)"),
                 io.String.Input("save_as", default="",

@@ -7,6 +7,7 @@ import {
   toast, debounce, viewBlob, loadImage, setWidgetVisible, setWidgetObjVisible, setWidgetDim, fitNodeSize,
 } from "./lib/mm_ui.mjs";
 import { createRefreshChannel } from "./lib/mm_race.mjs";
+import { sourceOptions, sourceShouldShow, sourceValueFromLabel } from "./lib/mm_source.mjs";
 
 const SAVE_NODES = new Set(["MMPreviewSave"]);
 const LOADER = "MMLoadImage";
@@ -36,14 +37,16 @@ function loaderBody(loader) {
 
 // Which Load Image MM feeds this preview (same rules as find_loader in py/image_io.py):
 // source "#id" > auto (the one loader upstream of images, else the only loader).
-function findLoader(node) {
+function findLoader(node, { ignoreSource = false } = {}) {
   const g = node.graph || app.graph;
   const linkOf = (id) => (id == null ? null : (g.links?.get?.(id) ?? g.links?.[id]));
   const loaders = (g._nodes || []).filter((n) => nodeClass(n) === LOADER && n.mode !== 2 && n.mode !== 4);
-  const sel = String(node.widgets?.find((w) => w.name === "source")?.value ?? "auto").trim().replace(/^#/, "").trim();
-  if (sel && sel.toLowerCase() !== "auto") {
-    const n = loaders.find((x) => String(x.id) === sel);
-    return n ? { node: n, note: "" } : { node: null, note: `source #${sel}: no Load Image MM` };
+  if (!ignoreSource) {
+    const sel = String(node.widgets?.find((w) => w.name === "source")?.value ?? "auto").trim().replace(/^#/, "").trim();
+    if (sel && sel.toLowerCase() !== "auto") {
+      const n = loaders.find((x) => String(x.id) === sel);
+      return n ? { node: n, note: "" } : { node: null, note: `source #${sel}: no Load Image MM` };
+    }
   }
   const found = new Set();
   const seen = new Set();
@@ -128,6 +131,7 @@ function chooseLoader(node, many) {
     const items = many.map((n) => ({ content: loaderLabel(n), callback: () => {
       const sw = node.widgets?.find((w) => w.name === "source");
       if (sw) { sw.value = `#${n.id}`; sw.callback?.(sw.value); }
+      updateSourceVisibility(node);   // a pinned value must stay visible
       node.setDirtyCanvas?.(true, true);
       finish(n);
     } }));
@@ -152,6 +156,51 @@ async function resolveLoader(node) {
   if (r.many?.length > 1) return await chooseLoader(node, r.many);
   toast("error", "No source", "no Load Image MM found – add one or set source");
   return null;
+}
+
+// Visibility of the source picker (frontend-only combo): shown while the value
+// is not auto, while auto resolution is ambiguous (several Load Image MM nodes
+// could be the source), or while the source input socket is linked (that last
+// one lives in setWidgetObjVisible, which keeps a widget visible if its socket
+// is linked). Rebuilt in the same call: the option list (one label per current
+// loader, plus a "(missing)" entry for a #id that no longer exists) and the
+// selected entry. Callers re-check throttled (>=500 ms, from onDrawForeground),
+// after configure, and on source changes; only actual visibility changes
+// trigger the resize and redraw, so this can never loop.
+function updateSourceVisibility(node) {
+  const combo = node._mmSourceCombo;
+  const sw = node._mmSourceWidget;
+  if (!combo || !sw) return;
+  const g = node.graph || app.graph;
+  const loaders = (g._nodes || []).filter((n) => nodeClass(n) === LOADER && n.mode !== 2 && n.mode !== 4);
+  const { options, selected } = sourceOptions({
+    value: sw.value,
+    loaders: loaders.map((n) => ({ id: n.id, label: loaderLabel(n) })),
+  });
+  if (combo.options) combo.options.values = options;   // in place: keep the stored options object
+  else combo.options = { values: options };
+  if (combo.value !== selected) combo.value = selected;
+  if (combo.label !== "source") combo.label = "source";   // keep the name stable after source#1 dedupe
+  const sock = (node.inputs || []).find((i) => i.name === "source");
+  const strShow = sock?.link != null;   // string widget row: shown while its socket is linked
+  const many = (findLoader(node, { ignoreSource: true }).many?.length ?? 0) > 1;
+  const show = sourceShouldShow({ value: sw.value, many });
+  const key = (show ? "c" : "") + (strShow ? "s" : "");
+  if (key === node._mmSourceKey) return;
+  node._mmSourceKey = key;
+  node._mmSourceShown = show;
+  setWidgetObjVisible(node, sw, strShow);
+  setWidgetObjVisible(node, combo, show);
+  const before = node._mmSrcRows ?? 0;
+  const after = (show ? 1 : 0) + (strShow ? 1 : 0);
+  node._mmSrcRows = after;
+  if (after > before) {
+    fitNodeSize(node);
+  } else if (after < before && node.widgets?.some((w) => w.name === "comparer")) {
+    // comparer loaded: min height covers it; without it the saved size is kept
+    fitNodeSize(node, { shrinkHeight: true });
+  }
+  node.setDirtyCanvas?.(true, true);
 }
 
 function addTargetWidget(node) {
@@ -431,6 +480,7 @@ app.registerExtension({
     nodeType.prototype.onConnectionsChange = function (slot, type, isConnect, linkIds) {
       origConnections?.apply(this, arguments);
       this._rtRefreshTarget?.();  // images link changed -> source may change
+      updateSourceVisibility(this);  // linked/unlinked settles the picker immediately
       this.setDirtyCanvas?.(true, true);
     };
 
@@ -441,6 +491,21 @@ app.registerExtension({
       const r = origConfigure?.apply(this, arguments);
       this._rtRefreshTarget?.();
       applyAutoState(this);
+      updateSourceVisibility(this);   // workflow load: widgets restored, pickers settle
+      return r;
+    };
+
+    // graph changes (loader added/removed/renamed, links, values) surface on the
+    // next draw: re-check the source picker at most every 500 ms, toggling only
+    // on actual change so this never feeds back into a redraw loop
+    const origDrawFg = nodeType.prototype.onDrawForeground;
+    nodeType.prototype.onDrawForeground = function (...args) {
+      const r = origDrawFg?.apply(this, args);
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (now - (this._mmSourceCheckAt ?? 0) >= 500) {
+        this._mmSourceCheckAt = now;
+        updateSourceVisibility(this);
+      }
       return r;
     };
   },
@@ -857,6 +922,31 @@ app.registerExtension({
       node.setDirtyCanvas?.(true, true);
     }).catch((e) => console.error("[MM Nodepack] comparer not loaded", e));
     addTargetWidget(node);
+    // frontend-only source picker: the schema keeps the serializable string
+    // widget (position stays first, so name lookups keep finding it), hidden;
+    // the combo mirrors its value ("auto" or "#id") at its position
+    const srcW = node.widgets?.find((w) => w.name === "source");
+    if (srcW) {
+      // values must travel in options (the frontend throws for a combo without them)
+      const combo = node.addWidget("combo", "source", "auto", () => {}, { values: ["auto"], serialize: false });
+      combo.serialize = false;   // frontend-only: never part of widgets_values, never stored
+      combo.label = "source";    // the frontend may dedupe the name to "source#1"
+      combo.tooltip = "Which Load Image MM to save next to; shown only when several could be the source";
+      const ci = node.widgets.indexOf(combo);
+      if (ci !== -1) node.widgets.splice(ci, 1);
+      const si = node.widgets.indexOf(srcW);
+      if (si !== -1) node.widgets.splice(si + 1, 0, combo);
+      else node.widgets.push(combo);
+      combo.callback = (v) => {
+        const val = sourceValueFromLabel(v ?? combo.value);
+        if (srcW.value !== val) srcW.value = val;
+        srcW.callback?.(srcW.value);   // wrapped below: _rtNote reset + target refresh
+        node.setDirtyCanvas?.(true, true);
+      };
+      node._mmSourceCombo = combo;
+      node._mmSourceWidget = srcW;
+      node._mmSourceShown = false;
+    }
     // target preview updates when suffix/save_as/format change
     for (const name of ["suffix", "save_as", "format", "source"]) {
       const w = node.widgets?.find((x) => x.name === name);
@@ -864,7 +954,10 @@ app.registerExtension({
       const cb = w.callback;
       w.callback = (...a) => {
         cb?.(...a);
-        if (name === "source") node._rtNote = "";  // the run's note is outdated now
+        if (name === "source") {
+          node._rtNote = "";  // the run's note is outdated now
+          updateSourceVisibility(node);
+        }
         node._rtRefreshTarget?.();
       };
     }
@@ -884,5 +977,6 @@ app.registerExtension({
       };
     }
     node._rtRefreshTarget?.();
+    updateSourceVisibility(node);   // initial settle (guarded no-op without a combo)
   },
 });

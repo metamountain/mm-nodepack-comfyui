@@ -468,12 +468,67 @@ def run_playwright_tests(base_url):
                 mmSaveMinHeight: pvImgMinHeight,
             };
 
+            // MMPreviewSave source picker: hidden while auto is unambiguous, shown
+            // when several loaders could be the source, when a #id is pinned, or
+            // while the source socket is linked (then the string widget, not the combo).
+            const srcState = (n) => {
+                const vis = (w) => !!w && !w.hidden && w.type !== 'hidden';
+                // the combo may be deduped to name "source#1": match by type + name prefix;
+                // the schema string widget may be typed "text" in the V3 frontend, so
+                // match by name and exclude the combo by type
+                const combo = (n.widgets || []).find(w => (w._mmType || w.type) === 'combo' && /^source/.test(String(w.name || '')));
+                const str = (n.widgets || []).find(w => w.name === 'source' && (w._mmType || w.type) !== 'combo');
+                return {
+                    combo: vis(combo), str: vis(str),
+                    strType: str ? String(str._mmType || str.type) : null,
+                    value: str ? String(str.value) : null,
+                    comboValue: combo ? String(combo.value) : null,
+                    label: combo ? String(combo.label) : null,
+                    options: combo ? [...(combo.options?.values || [])] : [],
+                    checkAt: n._mmSourceCheckAt ?? null,
+                    drawWrapped: n.onDrawForeground ? String(n.onDrawForeground).includes('mmSourceCheckAt') : null,
+                };
+            };
+            const srcWait = (ms) => new Promise(r => setTimeout(r, ms));
+            // headless pages may run no idle canvas draw frames: force one so the
+            // throttled onDrawForeground check (500 ms) is guaranteed to run
+            const srcNudge = () => { app.canvas.draw?.(true, true); };
+            const srcInitial = srcState(pv);
+            // link the loader to the images input: auto resolves via that link,
+            // but the SOURCE socket itself is not linked -> both stay hidden
+            ld.connect(0, pv, 0);
+            srcNudge();
+            await srcWait(700);
+            const srcLinked = srcState(pv);
+            // disconnect and add a second loader: auto is ambiguous -> combo visible
+            const srcInp = pv.inputs.find(i => i.name === 'images');
+            if (srcInp && srcInp.link != null) {
+                if (app.graph.disconnectLink) app.graph.disconnectLink(srcInp.link);
+                else srcInp.link = null;
+            }
+            const l2 = LG.createNode('MMLoadImage');
+            app.graph.add(l2);
+            srcNudge();
+            await srcWait(700);
+            const srcMulti = srcState(pv);
+            // pin the first loader: the pinned value keeps the combo visible
+            const srcStrW = pv.widgets.find(w => w.name === 'source' && (w._mmType || w.type) !== 'combo');
+            if (srcStrW) {
+                srcStrW.value = '#' + ld.id;
+                srcStrW.callback?.(srcStrW.value);
+            }
+            await srcWait(700);
+            const srcPinned = srcState(pv);
+            const srcIds = { ld: ld.id, l2: l2.id };
+
             return {
                 created, stateDefault, stateCustom, stateRandom, stateBack,
                 stateCropCustom, remembered, hasPreviewLeak,
                 ldWidgetCounts, ldDefaultVis, ldFolderVis, ldSingleVis,
                 ldDefaultState, ldFolderState, ldSingleState,
                 hWithImage, ldAfterMin, hAfterSwitch, hBackSingle, minFinal, previewDef, previewMinParity,
+                srcInitial, srcLinked, srcMulti, srcPinned, srcIds,
+                pvInputs: (pv.inputs || []).map(i => i.name),
             };
         }""")
         browser.close()
@@ -550,7 +605,33 @@ def run_playwright_tests(base_url):
     assert report["previewDef"]["hasEmbedWorkflow"] is False, "embed_workflow widget must be removed from MMPreviewSave"
     assert report["previewDef"]["initSize"] >= report["previewDef"]["initMin"], f"MMPreviewSave clipped on create: {report['previewDef']}"
 
-    print("  OK: Playwright Chromium checks passed (0 console errors, 0 404s, all foldouts, shrink, mode buttons, no thumbnail crush, localStorage memory, no leaks)")
+    # MMPreviewSave source picker: hidden while auto is unambiguous (one loader,
+    # linked or not), shown when several loaders could be the source, and a
+    # pinned #id keeps it visible. The combo keeps the "source" label.
+    ld_id = report["srcIds"]["ld"]
+    l2_id = report["srcIds"]["l2"]
+    src = report["srcInitial"]
+    assert src["combo"] is False and src["str"] is False, f"source picker must be hidden with one loader and auto: {src}"
+    print(f"  MMPreviewSave inputs: {report['pvInputs']}")
+    src = report["srcLinked"]
+    assert src["combo"] is False, f"combo must stay hidden while linked auto is unambiguous: {src}"
+    # the images link feeds auto resolution; only a linked SOURCE socket would
+    # show the string widget (setWidgetObjVisible keeps it visible then)
+    assert src["str"] is False, f"string widget stays hidden while only the images socket is linked: {src}"
+    src = report["srcMulti"]
+    assert src["combo"] is True, f"combo must be visible with several candidate loaders: {src}"
+    assert src["str"] is False, f"string widget must be hidden again once the socket is unlinked: {src}"
+    assert any(o.startswith(f"#{ld_id} ") for o in src["options"]), f"loader #1 missing from options: {src['options']}"
+    assert any(o.startswith(f"#{l2_id} ") for o in src["options"]), f"loader #2 missing from options: {src['options']}"
+    assert src["label"] == "source", f"combo label must stay 'source' (got {src['label']!r})"
+    src = report["srcPinned"]
+    assert src["combo"] is True, f"pinned source must keep the combo visible: {src}"
+    assert src["value"] == f"#{ld_id}", f"pinned value not stored in the schema string widget: {src}"
+    expected = next((o for o in src["options"] if o.startswith(f"#{ld_id} ")), None)
+    assert expected is not None, f"pinned loader label missing from options: {src['options']}"
+    assert src["comboValue"] == expected, f"combo must show the pinned loader label: {src}"
+
+    print("  OK: Playwright Chromium checks passed (0 console errors, 0 404s, all foldouts, shrink, mode buttons, no thumbnail crush, localStorage memory, no leaks, source picker rule)")
 
 
 def main():

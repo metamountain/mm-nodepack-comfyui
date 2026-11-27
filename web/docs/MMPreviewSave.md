@@ -22,3 +22,4 @@ See the results, compare them with the source image and save the one you keep. O
 - PNG saves always embed the workflow metadata (prompt and settings).
 - Right-click the preview for quick open / copy actions on both the creation and the original.
 - Buttons that an active auto switch already handles are dimmed.
+- The `source` picker stays hidden while auto picks unambiguously (one loader upstream or the only one); it appears when several Load Image MM nodes could be the source, or when you pin one (`#id`) — picking `auto` hides it again.
