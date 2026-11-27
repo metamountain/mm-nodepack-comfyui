@@ -269,7 +269,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   };
   const stem = sourcePath ? String(sourcePath).replace(/\\/g, "/").split("/").pop().replace(/\.[^.]+$/, "") : "image";
   const btn1 = mk("save");
-  btn1.tooltip = node._rtTarget || "next free _# name next to the source";
+  btn1.tooltip = node._rtTarget || "save next to the source with the next free name";
   // no known home folder -> save behaves like save as: pasted images (Ctrl+V -> input/pasted/) and
   // uploads whose original was not found (picking/uploading leaves the loader's path empty then).
   // With no loader at all there is no home to be unknown: 'save' goes to output/preview_#.png,
@@ -286,7 +286,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
   };
   btn1.callback = () => (isPasted() ? btn2.callback() : serverSave(""));
   const btn2 = mk("save as…");
-  btn2.tooltip = "choose folder and name";
+  btn2.tooltip = "Choose a folder and a file name";
   btn2.callback = async () => {
     const suggested = (node._rtTarget ? String(node._rtTarget).replace(/\\/g, "/").split("/").pop() : "") || `${stem}_edit.png`;
     // the normal OS "save as" dialog (browser on the ComfyUI computer), starts in the target folder;
@@ -333,7 +333,7 @@ function addSaveButtons(node, entry, sourcePath, variant) {
     if (name != null && String(name).trim() !== "") await serverSave(String(name).trim());
   };
   const btn3 = mk("send to loader");
-  btn3.tooltip = "save as _# and load it in the Load Image MM (next run works on this creation)";
+  btn3.tooltip = "Save as _# and load it in Load Image MM, so the next run works on this creation";
   // savedPath: auto_save already wrote this creation -> send that file instead of saving a second copy
   const sendToLoader = async (savedPath) => {
     const loader = await resolveLoader(node);

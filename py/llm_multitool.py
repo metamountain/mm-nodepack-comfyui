@@ -60,40 +60,26 @@ from .common import CATEGORY, get_folder_paths, is_local_request, json_error, po
 HELP = {
     # Connection
     "api_url":
-        "Base URL of the server (llama.cpp, Ollama, LM Studio, vLLM, OpenAI ...).\n"
-        "Default: http://127.0.0.1:8080 (Ollama: http://127.0.0.1:11434).\n"
-        "Ignored when local_model is set.\n"
-        "On a shared server the URL must match an operator profile\n"
-        "(env MM_NODEPACK_LLM_PROFILES) before it may be contacted.",
+        "URL of the LLM server to use (llama.cpp, Ollama, LM Studio, vLLM, OpenAI ...).\n"
+        "On a shared server, only operator-approved URLs work.",
 
     "api_key_env":
-        "Name of the environment variable that holds the API key\n"
-        "(e.g. OPENAI_API_KEY, GEMINI_API_KEY).\n"
-        "The key is read via os.environ.get() at run time -- it is NEVER\n"
-        "stored in the workflow file.\n"
-        "Leave empty if the server needs no key (local servers).\n"
-        "On a shared server the variable must be the one named in the\n"
-        "approved operator profile (env MM_NODEPACK_LLM_PROFILES).",
+        "Name of the environment variable that holds your API key (e.g. OPENAI_API_KEY).\n"
+        "Leave empty for local servers that need no key.",
 
     "unload_after":
-        "Unload the model after the request finishes.\n"
-        "  llama.cpp / router -- POST /models/unload (frees VRAM)\n"
-        "  ollama             -- keep_alive 0 in the request\n"
-        "  openai / unsloth   -- no effect (cloud / managed)\n"
-        "On a shared server the profile must grant 'allow_unload' for it.\n"
-        "Recommended: True when sharing the GPU with ComfyUI rendering.",
+        "Unload the model after each run to free GPU memory.\n"
+        "Works with llama.cpp and Ollama; ignored for cloud APIs.",
 
     # Mode
     "mode":
-        "Select operating mode:\n"
-        "  auto     -- vision if an image is connected, otherwise text\n"
-        "  vision   -- Send image + text prompt, receive text reply\n"
-        "  text     -- Text-only prompt, no image needed",
+        "auto = vision if an image is connected, else text.\n"
+        "vision = image + text prompt, text reply. text = text only.",
 
     # Prompts
     "system_prompt":
-        "Defines the model role and behaviour.\n"
-        "Sent as the system message before your prompt.",
+        "Sets the role and behaviour of the model.\n"
+        "Sent before your prompt.",
 
     "user_prompt":
         "Your message to the model.\n"
@@ -101,132 +87,87 @@ HELP = {
 
     # Sampling
     "temperature":
-        "Controls output randomness.\n"
-        "0.0 = fully deterministic\n"
-        "1.0 = typical default\n"
-        "2.0 = very random / creative",
+        "Output randomness: 0 = deterministic, 1 = typical, 2 = very random.",
 
     "top_p":
-        "Nucleus sampling threshold.\n"
-        "Only tokens with cumulative prob <= top_p are sampled.\n"
-        "Typical: 0.95",
+        "Keep only tokens up to this cumulative probability. Typical: 0.95.",
 
     "top_k":
-        "Limit sampling to top-k most likely tokens.\n"
-        "Typical: 20-64\n"
-        "-1 = disabled (no limit)",
+        "Limit sampling to the k most likely tokens. Typical: 20-64. -1 = off.",
 
     "min_p":
-        "Minimum probability filter.\n"
-        "Excludes tokens below min_p x prob(top token).\n"
-        "0.0 = disabled (default)",
+        "Drop tokens weaker than this fraction of the top token. 0 = off.",
 
     "repetition_penalty":
-        "Penalise tokens that already appeared in the output.\n"
-        "1.0 = no effect (neutral)\n"
-        ">1.0 = reduce repetition  (recommended: 1.1)\n"
-        "<1.0 = encourage repetition (unusual)\n"
-        "Range: 0.0 - 2.0",
+        "Reduce repeated words. 1.0 = off, 1.1 = mild, higher = stronger.",
 
     "presence_penalty":
-        "OpenAI-style penalty for tokens seen at least once.\n"
-        "0.0 = no effect\n"
-        "Positive values push the model toward new topics.",
+        "Nudge the model toward new topics; positive values push harder.",
 
     # Output controls
     "max_tokens":
-        "Maximum tokens in the model reply (thinking counts too).\n"
-        "Empty response? Raise this or turn enable_thinking off.",
+        "Maximum reply length in tokens (thinking counts too).\n"
+        "Raise it if the reply comes back cut off.",
 
     "on_error":
-        "What happens on an error (server down, bad key, empty reply ...):\n"
-        "  stop        -- stop the queue with a red error message (safe)\n"
-        "  return text -- continue; 'response' holds a line starting with ERROR:\n"
-        "                 (careful: that text could end up as your image prompt)",
+        "stop = halt the queue with an error (safe).\n"
+        "return text = continue; the response starts with 'ERROR:'.",
 
     "seed":
-        "Random seed for reproducibility.\n"
-        "-1 = random: the node runs again on every queue (never cached)\n"
-        "Positive integer = fixed seed -> identical output for same input.",
+        "-1 = random: the node reruns on every queue (never cached).\n"
+        "A fixed seed repeats the same reply for the same input.",
 
     "timeout_s":
-        "HTTP request timeout in seconds.\n"
-        "Increase for slow hardware or very large models.\n"
-        "Range: 30 - 600 s",
+        "Seconds to wait for the server before the request times out.\n"
+        "Raise it for slow hardware or large models.",
 
     "max_retries":
-        "Auto-retries on timeout or connection drop.\n"
-        "Uses exponential back-off: 1 s, 2 s, 4 s ...\n"
-        "0 = no retries (fail immediately)",
+        "Retries on timeout or a dropped connection, with growing waits.\n"
+        "0 = fail immediately.",
 
     "enable_thinking":
-        "Enable chain-of-thought reasoning.\n"
-        "Internal reasoning appears in the 'thinking' output socket.\n"
-        "Increases latency. Best for complex reasoning tasks.",
+        "Let the model reason step by step before it answers.\n"
+        "The reasoning text appears on the 'thinking' output.",
 
     "reasoning_effort":
-        "Depth of chain-of-thought reasoning:\n"
-        "  none   -- disabled (fastest)\n"
-        "  low    -- brief reasoning\n"
-        "  medium -- balanced\n"
-        "  high   -- deepest reasoning (slowest)\n"
-        "Has no effect when enable_thinking=False.",
+        "How deeply the model reasons: none, low, medium or high.\n"
+        "Only used when enable_thinking is on.",
 
     "model_id_optional":
-        "Model ID to use. 'auto' = use whatever model the server\n"
-        "currently serves (detected via GET /v1/models).",
+        "'auto' = use whatever model the server currently serves.\n"
+        "Otherwise name the exact model ID.",
 
     "backend":
-        "Which server API dialect to speak:\n"
-        "  llama.cpp -- llama-server and forks (top_k, min_p,\n"
-        "              repeat_penalty, thinking via chat_template_kwargs)\n"
-        "  unsloth  -- Unsloth Studio (model from /api/inference/status)\n"
-        "  openai   -- plain OpenAI API, only standard fields are sent\n"
-        "              (top_k, min_p, repetition_penalty are ignored)\n"
-        "  ollama   -- Ollama native API (/api/chat, images as base64 array,\n"
-        "              keep_alive for VRAM management)",
+        "Which server API to speak: llama.cpp, Ollama, Unsloth or OpenAI.\n"
+        "OpenAI servers ignore top_k, min_p and repetition_penalty.",
 
     "extra_body":
-        "Optional JSON object merged into the request last,\n"
-        "overriding any field above. Example:\n"
-        "  {\"top_k\": 20, \"cache_prompt\": true}\n"
-        "Reserved fields may NOT be overridden: model, messages, stream,\n"
-        "max-token limits (max_tokens / num_predict / ...), and any\n"
-        "url / auth / token / header-like key -- also nested in backend\n"
-        "options. Leave empty for none.",
+        "Extra JSON merged into the request, overriding the fields above.\n"
+        "Model, limits, stream and auth fields cannot be overridden.",
 
     "local_model":
-        "Model to run:\n"
-        "  server (api_url) -- use whatever the server at api_url serves\n"
-        "  <gguf>           -- start a llama-server on port 8081 with this\n"
-        "                      GGUF (+ its mmproj for vision); api_url is ignored.\n"
-        "  <gguf> (text)    -- no mmproj next to it: text only, no images.\n"
-        "Scans the HF cache and ComfyUI models/LLM, text_encoders, clip\n"
-        "(and extra_model_paths.yaml) for GGUF files. Switching restarts the server.\n"
-        "On a shared server only profiles (env MM_NODEPACK_LLM_PROFILES) with\n"
-        "'allow_local_model' may start a server; their local_models list\n"
-        "can narrow which models are offered.",
+        "'server (api_url)' = use whatever the server at api_url serves.\n"
+        "A GGUF name = run that model on your own local llama-server.",
 
     "keep_alive":
         "Ollama only: seconds the model stays loaded after the reply.\n"
-        "0 = unload right away (frees VRAM for rendering).",
+        "0 = unload right away to free GPU memory.",
 
     "clean_output":
-        "Clean the reply: remove think blocks, Markdown and surrounding quotes.\n"
-        "Useful when the reply goes straight into a render prompt.",
+        "Strip think blocks, Markdown and quotes from the reply.\n"
+        "Use it when the reply goes straight into a render prompt.",
 
     "image_mode":
-        "single -- send only the first image\n"
-        "batch  -- send multiple images from the batch (up to 8) in one request",
+        "single = send only the first image.\n"
+        "batch = send up to 8 images in one request.",
 
     "image":
-        "Optional image. With mode 'auto' the node switches to vision\n"
-        "when an image is connected.",
+        "Optional image to send with the prompt.\n"
+        "With mode 'auto', connecting an image switches to vision.",
 
     "text":
-        "Optional text input (e.g. from another LLM or a prompt node).\n"
-        "If user_prompt contains {text} it is inserted there,\n"
-        "otherwise it is appended below user_prompt.",
+        "Optional extra text input (e.g. from another LLM).\n"
+        "{text} in user_prompt is replaced by it, otherwise it is appended.",
 }
 
 
@@ -1041,29 +982,9 @@ class MMLLMMultitool(io.ComfyNode):
             display_name="LLM Multitool MM",
             category=CATEGORY,
             description=(
-                "Vision / text LLM node for llama.cpp, Ollama, Unsloth Studio and "
-                "OpenAI-compatible servers (NInfer, LM Studio, vLLM, OpenAI, Gemini ...).\n\n"
-                "MODES: 'auto' sends vision when an image is connected and text otherwise; "
-                "'vision' sends image + text prompt and returns the text reply; 'text' is "
-                "text only.\n\n"
-                "MODEL: local_model starts its own llama-server (env LLM_MULTITOOL_PORT, "
-                "default 8081) for a local GGUF found in the HF cache or ComfyUI's LLM / "
-                "text_encoders / clip folders -- with an mmproj next to it it can see images, "
-                "without one it is listed as '<name> (text)'. 'server (api_url)' talks to "
-                "whatever the server at api_url serves; backend picks the API dialect.\n\n"
-                "THINKING: enable_thinking turns on chain-of-thought reasoning, reported on "
-                "the 'thinking' output; clean_output strips think blocks, Markdown and "
-                "surrounding quotes from the reply.\n\n"
-                "VRAM: the 'unload model' button on the node stops the own local server and "
-                "frees the model at api_url (llama.cpp router, Ollama); unload_after does the "
-                "same after each run. Recommended when sharing the GPU with rendering.\n\n"
-                "SHARED SERVER: when ComfyUI is shared (env MM_NODEPACK_SHARED_SERVER or a "
-                "non-loopback --listen), every target must match an operator profile from the "
-                "JSON file in env MM_NODEPACK_LLM_PROFILES (backend + allowed URL + credential "
-                "env-var name + lifecycle permissions + response size limit). Unknown "
-                "combinations are rejected before any credential is read or connection made; "
-                "extra_body may not override reserved fields (model, limits, stream, url/auth "
-                "keys). On a private loopback server all of this stays off."),
+                "Ask a local or remote LLM for a text answer, or describe and analyse images "
+                "with a vision model. Works with llama.cpp, Ollama, LM Studio, vLLM, Unsloth "
+                "and OpenAI-compatible servers."),
             search_aliases=["mm", "metamountain", "mm nodepack", "llm mm", "vision mm", "vlm"],
             inputs=[
                 # MODEL / CONNECTION
@@ -1131,10 +1052,10 @@ class MMLLMMultitool(io.ComfyNode):
             outputs=[
                 io.String.Output("response", tooltip="The model's reply text."),
                 io.String.Output("thinking",
-                                 tooltip="Chain-of-thought / reasoning (only when enable_thinking=True)."),
+                                 tooltip="Chain-of-thought reasoning, only when enable_thinking is on."),
                 io.String.Output("active_model",
-                                 tooltip="Model ID that was actually used for this inference."),
-                io.String.Output("active_mode", tooltip="Active mode string (vision / text)."),
+                                 tooltip="The model that actually answered."),
+                io.String.Output("active_mode", tooltip="The mode used for this run (vision or text)."),
             ],
         )
 

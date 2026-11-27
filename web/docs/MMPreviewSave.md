@@ -1,41 +1,24 @@
 # Preview & Save MM (`MMPreviewSave`)
 
-Replaces **Preview Image**, **Save Image**, and an **Image Comparer** in one node.
+See the results, compare them with the source image and save the one you keep. One node replaces preview, compare and save: hold or slide over the preview to compare the creation with the original from Load Image MM. Saves never overwrite an existing file.
 
-## Built-In Compare
+## How to use
 
-Toggle the compare mode directly below the preview (saved per workflow):
-- **`compare hold`** *(default)* — Press and hold on the preview to view the original from **Load Image MM**.
-- **`compare slide`** — Move/drag the divider across the image to compare original vs. result.
-- **`compare off`** — Plain preview.
+1. Connect your images; the node finds Load Image MM automatically as the source.
+2. Queue the workflow; the preview shows the results.
+3. Switch the compare mode below the preview: hold, slider or off.
+4. Select the creation you keep, then use **save** (next to the source, next free number), **save as…** (choose folder and name) or **send to loader** (saves and loads the result into Load Image MM for the next run).
+5. Or turn on `auto save` to save every result after each run, and `auto send` to feed them back into the loader automatically.
 
-Right-click the preview for quick **Open / Copy** actions on both the creation and the original.
+## Inputs / Outputs
 
-## Saving & Iteration Buttons
+- **Inputs:** `images`, `auto save`, `auto send`, `source`, `suffix`, `save as`, `format`, `quality`
+- **Output:** `saved` — one path per saved file (auto save)
 
-- **`save`** — Writes the selected image next to the source file as `<name>_1`, `<name>_2`, … without ever overwriting existing files (including across folder batch runs). With no loader in the graph, saves to `ComfyUI/output/preview_#.png`.
-- **`save as…`** — Opens the native OS save dialog pre-filled in the target folder (remembers its own last save folder separately from Load Image MM; uses the browser save picker remotely, or a filename prompt over plain HTTP).
-- **`send to loader`** — Saves as `_#` and loads the result straight back into **Load Image MM** (automatically switches the loader to single mode so the next run edits the new image).
+## Tips
 
-The preview panel matches ComfyUI's standard `LoadImage` / `PreviewImage` / **Load Image MM** minimum preview height (`220 px`) across all aspect ratios — staying compact on portrait and landscape images alike without shrinking user-set heights. PNG outputs always embed ComfyUI workflow metadata (prompt + `extra_pnginfo`) — no toggle needed.
-
-## Auto Switches
-
-| Widget | Description |
-|---|---|
-| `auto_save` | Automatically saves every generated image on run. |
-| `auto_send` | Automatically feeds every generated image back into **Load Image MM** (reuses the auto-saved file when `auto_save` is on). |
-| `suffix` | Filename suffix pattern (default `_#`, where `#` increments to the next free number). |
-| `save_as` | Optional custom filename or relative/absolute target path. |
-| `format` | `same as source`, `png`, `jpg`, or `webp`. |
-| `quality` | JPEG / WebP quality (`1–100`). |
-| `source` | `auto` finds the upstream (or only) **Load Image MM** wirelessly. With multiple loaders, enter its node number (e.g. `#12`) or let the node ask you to pick one when you turn `auto_send` on. |
-
-Manual buttons already handled by an active auto switch are dimmed automatically.
-
-### Safe auto-send
-
-`auto_send` never overwrites an ambiguous loader silently:
-
-- **several loaders** — a toast tells you to pick one in `source` (a small picker menu offers them when you enable the switch);
-- **loader in folder mode** — auto-send is skipped with a toast; use `send to loader`, which switches the loader to single mode first.
+- Saves next to the source are numbered `name_1`, `name_2`, … so existing files are never touched; with no loader the files go to the `output` folder instead.
+- `auto send` is skipped (with a toast) when several loaders exist or the loader is in folder mode — use **send to loader**, which switches the loader to single mode first. With `auto save` on, the auto-saved file is the one that gets sent.
+- PNG saves always embed the workflow metadata (prompt and settings).
+- Right-click the preview for quick open / copy actions on both the creation and the original.
+- Buttons that an active auto switch already handles are dimmed.

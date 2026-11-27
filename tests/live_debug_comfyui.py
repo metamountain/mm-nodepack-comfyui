@@ -24,6 +24,8 @@ import urllib.request
 
 from PIL import Image
 
+from _proc_guard import kill_with_parent
+
 
 COMFY_PYTHON = r"D:\ComfyUI_windows_portable\python_embeded\python.exe"
 COMFY_MAIN = r"D:\ComfyUI_windows_portable\ComfyUI\main.py"
@@ -581,6 +583,7 @@ def main():
                     ],
                     stdout=log_f, stderr=subprocess.STDOUT, env=env,
                 )
+                kill_with_parent(proc)  # no orphaned server if this script is killed hard
                 if not wait_server(base_url, timeout_s=90):
                     log_f.close()
                     log_f = None

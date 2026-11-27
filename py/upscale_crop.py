@@ -623,90 +623,64 @@ class MMUpscaleCrop(io.ComfyNode):
             display_name="Upscale Crop MM",
             category=CATEGORY,
             description=(
-                "Upscale and crop in one node. UPSCALE sets the size -- ask for it as a "
-                "percent, a factor, a shortest or longest side, or a megapixel count, "
-                "whichever is natural for what you are doing. Those five keep the aspect "
-                "ratio. 'custom' takes a width x height box instead and gives you exactly "
-                "that: it covers the box and crops to it, so the resolution you type is "
-                "the resolution that comes out. Every mode works downwards too, so this "
-                "is also your downscaler.\n\n"
-                "CROP is off by default and only ever cuts, never rescales, so nothing is "
-                "resampled twice. Switch it on and pick a classic format -- 4:5, 1:1, 3:2, "
-                "DIN, 16:9 and the rest (or crop_width x crop_height for an exact shape) "
-                "-- with crop_orientation deciding which way round it sits ('auto' follows "
-                "the frame, which is what a mixed batch of portrait and landscape shots "
-                "needs), and crop_position plus crop_offset_x / crop_offset_y deciding "
-                "what survives.\n\n"
-                "THE MODEL IS BUILT IN. method defaults to 'lanczos'; switch it to "
-                "'upscaler model' and upscale_model picks the file straight from your "
-                "models/upscale_models folder -- no separate loader node to wire up. One "
-                "pass at the model's native scale, then a single resize onto the target, "
-                "so a 4x model hitting a 2x target does not leave you with a needlessly "
-                "huge intermediate. Tiling is automatic and halves itself if VRAM runs "
-                "short.\n\n"
-                "EXACT SIZE BY DEFAULT. With snap off you get exactly the size you asked "
-                "for. Switch snap on to round the result to multiple_of (8 suits SD, "
-                "SDXL and Flux).\n\n"
-                "IF NOTHING SEEMS TO HAPPEN. Only the widgets that currently apply are "
-                "shown, so switching target_mode swaps the size field and switching "
-                "method to 'upscaler model' reveals the model picker -- a value you set "
-                "earlier is not gone, just not in use. The info output always names the "
-                "mode and method that actually ran."),
+                "Resize by percentage, factor, side, megapixels or an exact width x height "
+                "box, and optionally crop to a format like 4:5, 1:1 or 16:9. Works down "
+                "as well as up, with an upscaler model as an option."),
             search_aliases=["mm", "metamountain", "mm nodepack", "upscale mm", "crop mm"],
             inputs=[
                 io.Image.Input("image",
                                tooltip="The image to resize and optionally crop."),
                 io.Combo.Input("target_mode", options=list(TARGET_MODES), default="scale_factor",
-                               tooltip="How you want to ask for the size. The first five keep the aspect ratio. 'custom' takes a target_width x target_height box and gives you exactly that -- it covers the box and crops to it, so the resolution you type is the resolution you get. All of them work downwards as well as up."),
+                               tooltip="How you ask for the size; the first five keep the aspect ratio.\ncustom = an exact width x height box. All work down as well as up."),
                 io.Float.Input("scale_factor", default=2.0, min=0.05, max=8.0, step=0.05,
-                               tooltip="Used by target_mode scale_factor. The same thing as percent, expressed the other way."),
+                               tooltip="target_mode scale_factor: multiply the size (2 = double, 0.5 = half)."),
                 io.Float.Input("scale_percent", default=200.0, min=1.0, max=800.0, step=5.0,
-                               tooltip="Used by target_mode scale_percent. 200 doubles, 50 halves."),
+                               tooltip="target_mode scale_percent: 200 = double the size, 50 = half."),
                 io.Int.Input("shortest_side", default=1024, min=64, max=16384, step=8,
-                             tooltip="Used by target_mode shortest_side. Pins min(width, height); the other side follows the aspect ratio."),
+                             tooltip="target_mode shortest_side: pins the shorter side; the other follows the aspect ratio."),
                 io.Int.Input("longest_side", default=2048, min=64, max=16384, step=8,
-                             tooltip="Used by target_mode longest_side. Pins max(width, height)."),
+                             tooltip="target_mode longest_side: pins the longer side; the other follows the aspect ratio."),
                 io.Float.Input("megapixels", default=2.0, min=0.1, max=64.0, step=0.1,
-                               tooltip="Used by target_mode megapixels. Pins the total pixel count; the shape is unchanged."),
+                               tooltip="target_mode megapixels: pins the total pixel count; the shape is unchanged."),
                 io.Int.Input("target_width", default=1920, min=64, max=16384, step=8,
-                             tooltip="Width of the box. target_mode 'custom' gives you exactly this."),
+                             tooltip="target_mode custom: the exact output width."),
                 io.Int.Input("target_height", default=1080, min=64, max=16384, step=8,
-                             tooltip="Height of the box. target_mode 'custom' gives you exactly this."),
+                             tooltip="target_mode custom: the exact output height."),
                 io.Combo.Input("resize_condition", options=list(RESIZE_CONDITIONS), default="always",
-                               tooltip="Failsafe switch for the absolute target modes (shortest_side, longest_side, megapixels, custom): downscale_only leaves the image untouched when the target is not smaller, upscale_only when it is not larger -- the resize and the upscale model are skipped together and the image leaves the node exactly as it came in. In custom mode a box bigger than the source keeps the source intact instead of upscaling to it. scale_percent and scale_factor are relative and always resize, so the widget is hidden for them. Anything unknown falls back to 'always'."),
+                               tooltip="Failsafe for the absolute target sizes:\ndownscale_only / upscale_only leave the image unchanged when the target would not really resize it."),
                 io.Combo.Input("method", options=list(METHODS), default="lanczos",
-                               tooltip="How to resample. Default is lanczos, the sharpest plain kernel. 'upscaler model' uses the upscale_model below; area is the best choice for heavy downscaling."),
+                               tooltip="How to resample. lanczos (default) is the sharpest plain kernel;\narea is best for heavy downscaling; upscaler model uses the model below."),
                 io.Combo.Input("upscale_model", options=model_opts, default=model_opts[0],
-                               tooltip="Used when method is 'upscaler model'. Read straight from models/upscale_models -- no loader node needed. UltraSharp, Remacri, Siax and RealESRGAN are listed first if you have them, since they are the usual general-purpose picks."),
+                               tooltip="Used when method is upscaler model.\nPicked from your models/upscale_models folder -- no loader node needed."),
                 io.Boolean.Input("snap", default=False, label_on="snap to multiple_of", label_off="exact size",
-                                 tooltip="Off: you get exactly the size you asked for. On: the result is rounded to a multiple of multiple_of (e.g. 8 for SD, SDXL and Flux VAEs). ComfyUI's VAE Encode crops a few pixels itself when a size is not a multiple, so this is optional."),
+                                 tooltip="Off = the exact size you asked for; On = round the result to multiple_of.\n8 suits SD, SDXL and Flux."),
                 io.Int.Input("multiple_of", default=8, min=1, max=512, step=1,
-                             tooltip="Used when snap is on: the result is rounded to a multiple of this. 8 suits SD, SDXL and Flux; 64 for some tiling and video workflows."),
+                             tooltip="Used when snap is on: the result is rounded to a multiple of this.\n8 suits SD, SDXL and Flux."),
                 io.Boolean.Input("crop", default=False,
-                                 tooltip="Off = pure upscaler. On = cut a format out of the result afterwards. Always on for target_mode 'custom', which has to crop to reach the box you typed."),
+                                 tooltip="Off = pure upscaler. On = cut a format out of the result afterwards.\nAlways on for target_mode custom, which crops to the box you typed."),
                 io.Combo.Input("crop_ratio", options=list(RATIO_NAMES), default="16:9",
-                               tooltip="The format to cut. Always takes the largest window of that shape that fits. 'custom' uses the crop_width x crop_height box below. Ignored by target_mode 'custom' -- that already cuts to its box, so the size you typed is the size you get."),
+                               tooltip="The format to cut; it takes the largest window of that shape that fits.\ncustom = your own box below. Ignored by target_mode custom."),
                 io.Int.Input("crop_width", default=1024, min=64, max=16384, step=8,
-                             tooltip="Width of the crop window for crop_ratio 'custom'."),
+                             tooltip="Width of the crop window for crop_ratio custom."),
                 io.Int.Input("crop_height", default=1024, min=64, max=16384, step=8,
-                             tooltip="Height of the crop window for crop_ratio 'custom'."),
+                             tooltip="Height of the crop window for crop_ratio custom."),
                 io.Combo.Input("crop_orientation", options=list(ORIENTATIONS), default="auto",
-                               tooltip="Which way round the format sits. 'auto' follows the source, so a portrait frame gets a portrait crop and a landscape one gets landscape -- the right choice for a mixed batch. Ignored for 1:1 and for custom."),
+                               tooltip="Which way the format sits.\nauto follows the source -- right for mixed batches. Ignored for 1:1 and custom."),
                 io.Combo.Input("crop_position", options=list(CROP_POSITIONS), default="center",
-                               tooltip="Where the window sits before the offsets nudge it. 'random' places it anywhere that fits, driven by crop_seed -- for varying the framing across a batch or a dataset."),
+                               tooltip="Where the window sits; the offsets then nudge it.\nrandom = anywhere that fits, driven by crop_seed."),
                 io.Int.Input("crop_offset_x", default=0, min=-8192, max=8192, step=8,
-                             tooltip="Nudge the window sideways in px. Positive moves right. Clamped so it can never leave the image."),
+                             tooltip="Nudge the window sideways in px. Positive = right. Clamped to the image."),
                 io.Int.Input("crop_offset_y", default=0, min=-8192, max=8192, step=8,
-                             tooltip="Nudge the window up or down in px. Positive moves down. Clamped so it can never leave the image. You can also just drag the window in the preview."),
+                             tooltip="Nudge the window up or down in px. Positive = down. You can also drag it in the preview."),
                 io.Int.Input("crop_seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF,
                              control_after_generate=ctrl_rand,
-                             tooltip="Only used when crop_position is 'random'. The same seed always gives the same window, so a framing you liked can be reproduced; set control_after_generate to randomize for a new one each run."),
+                             tooltip="Used with crop_position random: the same seed always gives the same window,\nso a framing you liked can be reproduced."),
             ],
             outputs=[
                 io.Image.Output("image", tooltip="The resized (and optionally cropped) image."),
                 io.Int.Output("width", tooltip="Final width in px."),
                 io.Int.Output("height", tooltip="Final height in px."),
-                io.String.Output("info", tooltip="What actually happened: sizes, the method used, the crop applied, and any fallback."),
+                io.String.Output("info", tooltip="What actually ran: sizes, method, the crop applied and any fallback."),
             ],
             hidden=[io.Hidden.unique_id],
         )

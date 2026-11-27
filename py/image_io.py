@@ -216,33 +216,33 @@ class MMLoadImage(io.ComfyNode):
             node_id="MMLoadImage",
             display_name="Load Image MM",
             category=CATEGORY,
-            description="Load a single image (upload or full path) or batch from a folder (incremental or random). "
-                        "Preview & Save MM automatically detects the source.",
+            description="Load one image, or a folder batch, incrementally or at random; give a file, an "
+                        "upload or a folder path. Preview & Save MM finds this node automatically as the source.",
             search_aliases=ALIASES + ["mm load", "load image mm", "load image path", "load image folder", "batch"],
             inputs=[
                 io.Combo.Input("mode", options=["single", "folder"], default="single",
-                               tooltip="single image or folder batch"),
+                               tooltip="single = one image, folder = batch"),
                 io.Combo.Input("image", options=_input_images() or [""], upload=io.UploadType.image,
-                               tooltip="upload from ComfyUI/input (used when 'path' is empty)"),
+                               tooltip="Pick an image you uploaded to ComfyUI (used when 'path' is empty)"),
                 io.String.Input("path", default="",
-                                tooltip="full file path – wins over the upload; Preview & Save MM saves next to this file"),
+                                tooltip="Full file path on the server. Wins over the upload; saves go next to this file"),
                 io.String.Input("folder", default="",
-                                tooltip="folder containing images for incremental or random loading"),
+                                tooltip="Full path of a folder containing the images to load"),
                 io.Boolean.Input("batch_mode", default=False, label_on="random", label_off="incremental",
-                                 tooltip="incremental: step through folder in natural order; random: pick using index as seed"),
+                                 tooltip="incremental = step through in file order, random = index picks the image as a seed"),
                 io.Int.Input("index", default=1, min=1, max=0xFFFFFFFFFFFFFFFF, control_after_generate=ctrl_inc,
-                             tooltip="1-based image index for incremental (1 = first image, wraps after last) or seed for random"),
+                             tooltip="Which image of the folder: 1 = first, wraps after the last. Random mode uses it as the seed"),
             ],
             outputs=[
                 io.Image.Output("image"),
                 io.Mask.Output("mask"),
                 io.Int.Output("width"),
                 io.Int.Output("height"),
-                io.String.Output("path", display_name="path", tooltip="resolved absolute path"),
+                io.String.Output("path", display_name="path", tooltip="Full path of the loaded file"),
                 io.Image.Output("image_list", display_name="image list", is_output_list=True,
-                                tooltip="all images in the folder as a ComfyUI IMAGE list (each keeps its own resolution); single image in single mode"),
+                                tooltip="Every image of the folder in file order; one image in single mode"),
                 io.Int.Output("index", display_name="index",
-                              tooltip="1-based index of the loaded image in the folder (1 in single mode)"),
+                              tooltip="Position of the loaded image in the folder (always 1 in single mode)"),
             ],
             hidden=[io.Hidden.unique_id, io.Hidden.prompt],
         )
@@ -364,31 +364,30 @@ class MMPreviewSave(io.ComfyNode):
             display_name="Preview & Save MM",
             category=CATEGORY,
             is_output_node=True,
-            description="Preview the creations, compare them with the original (slider) and save the selected one "
-                        "next to the source per button (name_1, name_2 … or save as) – or every run with auto_save. "
-                        "Uploads (ComfyUI/input) are saved to ComfyUI/output. "
-                        "PNG saves always embed the prompt + workflow metadata.",
+            description="See the results, compare them with the source image and save the one you keep. "
+                        "Saves go next to the source image (or to the output folder for uploads), "
+                        "never overwriting an existing file.",
             search_aliases=ALIASES + ["mm preview", "mm save", "preview save mm", "preview image mm", "save image mm", "compare"],
             inputs=[
                 io.Image.Input("images"),
                 io.Boolean.Input("auto_save", default=False, label_on="auto save", label_off="no autosave",
-                                 tooltip="on: every run saves all creations; off: preview only, save with the buttons"),
+                                 tooltip="on = every run saves all results; off = preview only, save with the buttons"),
                 io.Boolean.Input("auto_send", default=False, label_on="auto send", label_off="no autosend",
-                                 tooltip="on: after every run the result is saved as _# and put into the Load Image MM, "
-                                         "so the next run edits it (with auto save on, the auto-saved file is used); "
-                                         "skipped (with a toast) when several loaders exist or the loader is in folder mode"),
+                                 tooltip="After every run, saves the result and sends it to Load Image MM. "
+                                         "Next run edits it. "
+                                         "Skipped (toast) with several loaders or folder mode."),
                 io.String.Input("source", default="auto",
                                 tooltip="auto = the Load Image MM upstream (or the only one); "
-                                        "with several loaders type its number, e.g. #12"),
+                                        "with several loaders, type its number, e.g. #12"),
                 io.String.Input("suffix", default="_#",
-                                tooltip="appended to the source name; '#' = next free number (name_1, name_2 …)"),
+                                tooltip="Added to the source name. # = next free number (name_1, name_2 …)"),
                 io.String.Input("save_as", default="",
-                                tooltip="auto save only: empty = next to the source with the suffix; a name or a full path"),
+                                tooltip="Auto save only: empty = next to the source with the suffix, or a name or full path"),
                 io.Combo.Input("format", options=FORMATS, default="same as source"),
-                io.Int.Input("quality", default=95, min=1, max=100, tooltip="jpg/webp quality"),
+                io.Int.Input("quality", default=95, min=1, max=100, tooltip="Quality for JPEG and WebP saves"),
             ],
             outputs=[
-                io.String.Output("saved_paths", display_name="saved", tooltip="one path per line (auto save)"),
+                io.String.Output("saved_paths", display_name="saved", tooltip="The saved file paths, one per line (auto save)"),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo, io.Hidden.unique_id],
         )

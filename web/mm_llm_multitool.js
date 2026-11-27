@@ -65,8 +65,8 @@ app.registerExtension({
             const status = this.addWidget("text", "active", "-", () => {}, { serialize: false });
             status.serialize = false;
             status.disabled = true;
-            status.tooltip = "Model that answered the last run (read-only).\n" +
-                "local-<name> = own llama-server on port 8081 from 'local_model'.";
+            status.tooltip = "The model that answered the last run (read-only).\n" +
+                "local-<name> = the local server started by local_model.";
             this._llmStatus = status;
             // The current frontend draws a disabled widget by its label only,
             // so the text goes into the label as well as the value.
@@ -105,11 +105,8 @@ app.registerExtension({
                 }
             }, { serialize: false });
             unload.serialize = false;
-            unload.tooltip = "Free VRAM now:\n" +
-                "- stops the node's own llama-server (local_model, port 8081, shared by all nodes)\n" +
-                "- llama.cpp router at api_url: unloads its loaded model\n" +
-                "- ollama: unloads its loaded models (keep_alive 0)\n" +
-                "- openai / unsloth / plain llama-server: nothing to unload";
+            unload.tooltip = "Free GPU memory: stops your local server or unloads the model at api_url.\n" +
+                "llama.cpp and Ollama; cloud APIs have nothing to unload.";
             fitNodeSize(this);
             this._llmFit = setupAutoGrow(this);
 

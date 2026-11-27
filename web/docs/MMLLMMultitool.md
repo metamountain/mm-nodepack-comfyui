@@ -1,76 +1,29 @@
 # LLM Multitool MM (`MMLLMMultitool`)
 
-One node for vision and text LLM calls against **llama.cpp**, **NInfer**, **Ollama**, **Unsloth Studio**, and any **OpenAI-compatible** server.
+Ask a local or remote LLM for a text answer, or describe and analyse images with a vision model. Works with llama.cpp, NInfer, Ollama, Unsloth Studio and any OpenAI-compatible server. The node can also start its own local server for a GGUF model.
 
-## Modes (`mode`)
+## How to use
 
-- **`auto`** *(default)* — Uses `vision` when an `image` is connected, otherwise `text`.
-- **`vision`** — Sends `image` + prompt to a vision-capable model.
-- **`text`** — Text-only prompt.
+1. Pick where the model comes from: `local_model` = **server (api_url)** talks to the server at `api_url`, or pick a GGUF name to start your own local server (an `mmproj` file next to it enables vision).
+2. Set `backend` to the server's API (`llama.cpp`, `ollama`, `openai`, `unsloth`).
+3. Write your `system_prompt` and `user_prompt`; `mode` = `auto` switches to vision when you connect an image.
+4. Adjust sampling (`temperature`, `top_p`, `top_k`, `min_p`) and `max_tokens` to taste.
+5. Queue the workflow: the reply comes out on `response`, reasoning on `thinking`, and the node shows which model answered.
+6. Free the GPU again with the **unload model** button, or set `unload_after` to unload after every run.
 
-When multiple images are passed in a batch, **`image_mode`** switches between **`single`** (first frame only) and **`batch`** (all frames).
+## Inputs / Outputs
 
-## Model & Server Options
+- **Inputs:** `local_model`, `api_url`, `backend`, `model_id`, `api_key_env`, `mode`, `system_prompt`, `user_prompt`, sampling (`temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty`), `max_tokens`, `seed`, `enable_thinking`, `reasoning_effort`, `clean_output`, `image_mode`, `unload_after`, `keep_alive`, `on_error`, `timeout_s`, `max_retries`, `extra_body`, `image`, `text`
+- **Outputs:** `response`, `thinking`, `active_model`, `active_mode`
 
-- **`local_model = server (api_url)`** — Talks to whatever server is running at `api_url` (default `http://127.0.0.1:8080`, Ollama `http://127.0.0.1:11434`). Set `model_id = auto` to use the server's currently loaded model.
-- **`local_model = <GGUF>`** — Automatically starts a managed `llama-server` on port `8081` (override via `LLM_MULTITOOL_PORT`) for any GGUF found in your HF cache or ComfyUI's `LLM` / `text_encoders` / `clip` folders. If an `mmproj` file sits beside it, vision works automatically.
-- **`backend`** — API dialect: `llama.cpp` (also covers NInfer), `ollama`, `openai`, or `unsloth`.
-- **NInfer failsafes:** Automatically clamps `top_k` to NInfer's `[0, 20]` range and reports a clear hint if `vision` is called against a text-only NInfer profile.
+## Tips
 
-## Prompts & Security
+- `model_id` = `auto` uses whatever model the server currently has loaded.
+- Sharing the GPU with rendering? Keep `unload_after` on, or use the **unload model** button between runs.
+- `clean_output` strips think blocks, Markdown and quotes — useful when the reply goes straight into a render prompt.
+- `api_key_env` names an environment variable on the server; the key itself is never stored in the workflow.
+- `extra_body` passes extra JSON options, but reserved fields (model, limits, stream, auth) cannot be overridden.
 
-- **`system_prompt`** and **`user_prompt`** boxes grow automatically with their text.
-- Optional **`text`** input is inserted at `{text}` in `user_prompt` (or appended below).
-- **`api_key_env`** names an environment variable (e.g. `OPENAI_API_KEY`) read at run time — keys are **never** saved inside workflow JSON.
-- **`extra_body`** accepts optional JSON merged into the request payload. Reserved fields may **not** be overridden: `model`, `messages`, `stream`, the max-token limits (`max_tokens` / `num_predict` / …) and any url / auth / token / header-like key — also nested in backend options like Ollama's `options`.
+## Shared server
 
-## Shared Server: LLM Profiles
-
-When ComfyUI is **shared** (same switch as the file policy: non-loopback `--listen`, or `MM_NODEPACK_SHARED_SERVER=1`), every LLM request — a queued node **and** the `unload model` route, which has no browser request to authenticate — must match an **operator-owned profile** before any credential is read, any discovery happens, any connection is opened, or the managed `llama-server` is started or stopped.
-
-Profiles live in one JSON file pointed to by the environment variable **`MM_NODEPACK_LLM_PROFILES`** (set in the ComfyUI start script):
-
-```json
-{
-  "profiles": [
-    {
-      "id": "ninfer",
-      "backends": ["llama.cpp"],
-      "urls": ["http://127.0.0.1:8080"],
-      "api_key_env": "NINFER_API_KEY",
-      "allow_unload": true,
-      "allow_local_unload": false,
-      "allow_local_model": true,
-      "local_models": ["Qwen3.8-27B"],
-      "max_response_bytes": 2097152
-    }
-  ]
-}
-```
-
-| Field | Meaning |
-|---|---|
-| `backends` | API dialects this profile covers (`llama.cpp`, `ollama`, `openai`, `unsloth`). |
-| `urls` | Allowed base URLs (compared normalized, `http://host:port`). |
-| `api_key_env` | Environment variable holding the key; `""` = no key required. |
-| `allow_unload` | Remote unload: the `unload model` route and `unload_after` against these URLs. |
-| `allow_local_unload` | The route may stop the managed local `llama-server`. |
-| `allow_local_model` | A local GGUF `llama-server` may be started. |
-| `local_models` | Optional: only these scanned model labels may be selected (empty/omitted = any). |
-| `max_response_bytes` | Response size limit (default 8 MiB) — enforced while streaming, before JSON decoding. |
-
-A workflow is accepted when **backend + normalized `api_url` + `api_key_env`** match one profile exactly (local runs match on the label). Any unknown combination is rejected with a **redacted** error — it never echoes the key, the env-var value, or a URL with credentials. Requests with a key never follow redirects. On a **private loopback server** none of this applies: existing workflows and the `unload model` button keep working unchanged (a non-local request on a private server is still profile-bound, like the image routes).
-
-## VRAM Management
-
-- **`unload model` button** on the node immediately stops the managed local server and unloads the active model on `api_url` (llama.cpp router / Ollama).
-- **`unload_after = True`** unloads automatically after every run (recommended when sharing the GPU with ComfyUI rendering).
-
-## Outputs
-
-| Output | Type | Description |
-|---|---|---|
-| `response` | `STRING` | Model reply (or `ERROR: …` when `on_error = return text`). |
-| `thinking` | `STRING` | Chain-of-thought content when `enable_thinking = True`. |
-| `active_model` | `STRING` | Model ID that answered (also shown directly on the node). |
-| `active_mode` | `STRING` | Resolved operating mode (`vision` or `text`). |
+On a shared server, every LLM target you choose must be approved by the operator: they list the allowed servers in a profile file (the `MM_NODEPACK_LLM_PROFILES` variable) — per server: the API, the URL, the key variable, and the permissions (remote unload, starting a local model, which models, response size limit). Any combination that is not on that list is rejected before a request is made, and error messages never echo keys or full URLs. On a private (local) server none of this applies.
