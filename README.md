@@ -4,75 +4,82 @@
 
 # MM Nodepack
 
-Four small ComfyUI nodes that turn ComfyUI into a real image workbench: load and batch real files from disk, preview and save your edits right next to the source image, upscale and crop with a built-in model, and call local or remote LLMs. One install, one consistent UI, and built-in help on every node (the `?` button).
+Four ComfyUI nodes for working with real files: load an image or a whole folder from disk, compare and save results next to the source, resize and crop, and talk to local or remote LLMs.
+
+Together they close the loop. A result goes straight back into the loader, so one image can be edited step by step, a folder can be captioned image by image, and frames can be processed in order for a clip.
 
 ![send to loader](assets/send_to_loader.gif)
 
 *Flux.2 Klein edit loop: "add a cactus" → send → "make it blue" → send → "pink and white striped" → send.*
 
-All nodes live in the **MM Nodepack** category. Each one explains itself in-app — the `?` button on a node opens the same page as the [docs below](#nodes).
+## What you can do with it
+
+- **Edit in a loop.** Run, look, press **send to loader**, write the next prompt. Each step is saved as `name_1`, `name_2`, … and nothing is overwritten.
+- **Caption a folder.** Load Image MM in folder mode steps through the files; LLM Multitool MM describes each image; the `path` output tells a text-saving node which file each caption belongs to.
+- **Work on frames.** Step through an image sequence with `index`, process each frame and save it beside the original, ready to assemble into a clip.
+- **Keep paths.** Every image carries its full path, so saves, captions and other nodes know where the source lives.
 
 ## Nodes
 
 ### Load Image MM
 
-One loader for a single image or a folder batch — OS file dialog, drag & drop, paste or a plain file path.
+Loads a single image or a folder.
 
-- Single image (upload, dialog, drag & drop, paste or full path) or a folder as a batch
-- Step through a folder incrementally (`index`) or at random; `image list` gives the whole folder
-- Saves and other nodes find it automatically as the source image
-
-Full reference: [MMLoadImage.md](web/docs/MMLoadImage.md)
+- Single mode: pick a file with the OS dialog, drag & drop, paste, choose from `input/`, or type a full path (the path wins).
+- Folder mode: choose a folder; `batch_mode` steps through it `incremental` or `random`, `index` is the position (1-based).
+- Outputs `image`, `mask`, `width`, `height`, `path` (absolute), `image_list` (the whole folder in filename order) and `index`.
 
 ### Preview & Save MM
 
-See the results, compare them with the source (hold or slider) and save the one you keep.
+Shows the results, compares them with the source image and saves the ones you keep.
 
-- Saves next to the source image as `name_1`, `name_2`, … and never overwrites
-- `save as…` and **send to loader** (saves the result and feeds it back for the next run)
-- Optional `auto save` / `auto send` switches
-
-Full reference: [MMPreviewSave.md](web/docs/MMPreviewSave.md)
+- Compare with a slider or by holding the mouse on the preview.
+- **save** writes next to the source as `name_1`, `name_2`, … (`suffix`, `#` = next free number), **save as…** lets you pick the place.
+- **send to loader** saves the result and puts it into the loader for the next run.
+- `auto_save` saves every run; `auto_send` sends every run back to the loader.
+- `source` stays hidden while the loader is clear; it appears when several Load Image MM nodes could be the source.
+- Formats: PNG (with the workflow embedded), JPG, WebP. Without a loader the files go to `output/preview_#.png`.
 
 ### Upscale Crop MM
 
-Resize an image — percentage, factor, side, megapixels or an exact box — and crop it to a format like 4:5, 1:1 or 16:9.
+Resizes an image and crops it to an exact format.
 
-- Works down as well as up; an upscaler model from your `models/upscale_models` folder can replace the plain resampler
-- Classic formats or a custom box, with position, offsets and a draggable crop window in the live preview
-- `info` output tells you exactly what ran
-
-Full reference: [MMUpscaleCrop.md](web/docs/MMUpscaleCrop.md)
+- Size by percent, factor, shortest or longest side, megapixels or a custom box; down as well as up.
+- `method` is `lanczos` by default; `upscaler model` uses a model from `models/upscale_models`.
+- Crop to 4:5, 1:1, 16:9 and more, or a custom box; position, offsets, random position with a seed.
+- The live preview shows the result size, and the crop window can be dragged.
+- Outputs `image`, `width`, `height` and `info` (what was done).
 
 ### LLM Multitool MM
 
-Ask a local or remote LLM for a text answer, or describe and analyse images with a vision model.
+Sends text, or text with images, to an LLM and returns the answer.
 
-- llama.cpp, NInfer, Ollama, Unsloth Studio or any OpenAI-compatible server
-- Can start its own local server for a GGUF model found on your machine
-- `unload model` button and `unload_after` keep the GPU free for rendering
+- Works with llama.cpp, NInfer, Ollama, Unsloth Studio and any OpenAI-compatible server.
+- Can start its own `llama-server` for a GGUF model found on your machine (port `8081`, change with `LLM_MULTITOOL_PORT`).
+- **unload model** and `unload_after` free the GPU again for rendering.
 
-Full reference: [MMLLMMultitool.md](web/docs/MMLLMMultitool.md)
+### Free GPU
 
-Plus a small **free GPU** tile in the top action bar: it shows how much GPU memory ComfyUI itself holds and unloads all models on click.
+A small tile in the top action bar shows how much GPU memory ComfyUI holds; a click unloads all models.
 
 ## Install
 
-Shortest ways, either works:
-
-1. **ComfyUI Manager** — search for **MM Nodepack** and install.
-2. **git** — clone into `ComfyUI/custom_nodes` and restart ComfyUI:
+1. **ComfyUI Manager**: search for **MM Nodepack** and install.
+2. **git**: clone into `ComfyUI/custom_nodes` and restart ComfyUI:
 
    ```bash
    cd ComfyUI/custom_nodes
    git clone https://github.com/metamountain/mm-nodepack-comfyui
    ```
 
-No extra Python dependencies. If you want `LLM Multitool MM` to start its own local server, put `llama-server` on your `PATH` (or point `LLAMA_SERVER_BIN` at it); otherwise any running LLM server works.
+No extra Python dependencies. For the own local LLM server, put `llama-server` on your `PATH` or point `LLAMA_SERVER_BIN` at it; otherwise any running LLM server works.
 
 ## Shared server
 
-Running ComfyUI for other people? The pack locks down file access: it reads only from the `input/` and `output/` folders, writes only to `output/`, and never overwrites a file. LLM targets must be approved by you as the operator. Two environment variables in the ComfyUI start script control this: `MM_NODEPACK_SHARED_SERVER` (on/off, otherwise it switches on automatically for a non-loopback `--listen` address) and `MM_NODEPACK_LLM_PROFILES` (the list of allowed LLM servers). Details: [Load Image MM](web/docs/MMLoadImage.md#shared-server) and [LLM Multitool MM](web/docs/MMLLMMultitool.md#shared-server).
+When ComfyUI serves other people, the pack only reads from `input/` and `output/`, only writes to `output/`, and never overwrites a file. OS dialogs only open for the browser on the ComfyUI computer itself.
+
+- `MM_NODEPACK_SHARED_SERVER`: `1` / `0` forces the mode on or off; without it the mode switches on for a non-loopback `--listen` address.
+- `MM_NODEPACK_LLM_PROFILES`: the LLM servers users may call; other targets are refused.
 
 ## License
 
